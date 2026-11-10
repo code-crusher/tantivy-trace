@@ -6,32 +6,64 @@ use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
 use crate::schema::{Term, Type};
 use crate::TantivyError::InvalidArgument;
 
+/// State of the Levenshtein automaton a [`FuzzyTermQuery`] matches terms with.
+///
+/// Obtained from [`Automaton::start`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DfaState {
+    dfa_state: u32,
+    /// Whether a prefix of the term was already within the allowed distance.
+    ///
+    /// Always `false` for non-prefix queries.
+    prefix_matched: bool,
+}
+
 /// The Levenshtein automaton a [`FuzzyTermQuery`] matches terms with.
 ///
 /// Obtained from [`FuzzyTermQuery::automaton`], e.g. to stream the term dictionary
 /// and collect the terms the query expands to.
-pub struct DfaWrapper(pub(crate) DFA);
+pub struct DfaWrapper {
+    dfa: DFA,
+    prefix: bool,
+}
 
-impl Automaton for DfaWrapper {
-    type State = u32;
-
-    fn start(&self) -> Self::State {
-        self.0.initial_state()
+impl DfaWrapper {
+    pub(crate) fn new(dfa: DFA, prefix: bool) -> DfaWrapper {
+        DfaWrapper { dfa, prefix }
     }
 
-    fn is_match(&self, state: &Self::State) -> bool {
-        match self.0.distance(*state) {
-            Distance::Exact(_) => true,
-            Distance::AtLeast(_) => false,
+    fn is_exact(&self, dfa_state: u32) -> bool {
+        matches!(self.dfa.distance(dfa_state), Distance::Exact(_))
+    }
+}
+
+impl Automaton for DfaWrapper {
+    type State = DfaState;
+
+    fn start(&self) -> Self::State {
+        let dfa_state = self.dfa.initial_state();
+        DfaState {
+            dfa_state,
+            prefix_matched: self.prefix && self.is_exact(dfa_state),
         }
     }
 
-    fn can_match(&self, state: &u32) -> bool {
-        *state != levenshtein_automata::SINK_STATE
+    fn is_match(&self, state: &Self::State) -> bool {
+        // For prefix queries, a match is sticky: once a prefix of the term was within the
+        // allowed distance, the term matches whatever its remaining characters are.
+        state.prefix_matched || self.is_exact(state.dfa_state)
+    }
+
+    fn can_match(&self, state: &Self::State) -> bool {
+        state.prefix_matched || state.dfa_state != levenshtein_automata::SINK_STATE
     }
 
     fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
-        self.0.transition(*state, byte)
+        let dfa_state = self.dfa.transition(state.dfa_state, byte);
+        DfaState {
+            dfa_state,
+            prefix_matched: state.prefix_matched || (self.prefix && self.is_exact(dfa_state)),
+        }
     }
 }
 
@@ -171,12 +203,11 @@ impl FuzzyTermQuery {
                 InvalidArgument("The fuzzy term query requires a string term.".to_string())
             })?
         };
-        let automaton = if self.prefix {
-            automaton_builder.build_prefix_dfa(term_text)
-        } else {
-            automaton_builder.build_dfa(term_text)
-        };
-        Ok(DfaWrapper(automaton))
+        // `build_prefix_dfa` loses matches whose best prefix is exactly at the maximum
+        // distance when later characters push the full term above it. Instead, use the
+        // plain DFA and keep track of whether a prefix already matched (see `DfaWrapper`).
+        let automaton = automaton_builder.build_dfa(term_text);
+        Ok(DfaWrapper::new(automaton, self.prefix))
     }
 
     fn specialized_weight(&self) -> crate::Result<AutomatonWeight<DfaWrapper>> {
@@ -207,6 +238,118 @@ mod test {
     use crate::query::QueryParser;
     use crate::schema::{Schema, STORED, TEXT};
     use crate::{assert_nearly_equals, Index, IndexWriter, TantivyDocument, Term};
+
+    #[test]
+    pub fn test_fuzzy_prefix_does_not_miss_late_prefix_matches() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let name = schema_builder.add_text_field("name", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        // "bd" (a prefix of "bdaa") is two edits away from "bacd": removing "a" and "c".
+        // The best prefix is exactly at the maximum distance, and the last characters of
+        // "bdaa" push the distance to the full term above it.
+        index_writer.add_document(doc!(name => "bdaa"))?;
+        // Same with transpositions disabled: "ö" is two edits away from "caö".
+        index_writer.add_document(doc!(name => "ödd"))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let query = FuzzyTermQuery::new_prefix(Term::from_field_text(name, "bacd"), 2, true);
+        assert_eq!(searcher.search(&query, &Count)?, 1);
+        let query = FuzzyTermQuery::new_prefix(Term::from_field_text(name, "bacd"), 2, false);
+        assert_eq!(searcher.search(&query, &Count)?, 1);
+
+        let query = FuzzyTermQuery::new_prefix(Term::from_field_text(name, "caö"), 2, false);
+        assert_eq!(searcher.search(&query, &Count)?, 1);
+        Ok(())
+    }
+
+    /// Optimal string alignment distance, with transpositions optionally costing one.
+    fn osa_distance(left: &[char], right: &[char], transposition_cost_one: bool) -> usize {
+        let mut dist = vec![vec![0usize; right.len() + 1]; left.len() + 1];
+        for (i, row) in dist.iter_mut().enumerate() {
+            row[0] = i;
+        }
+        for j in 0..=right.len() {
+            dist[0][j] = j;
+        }
+        for i in 1..=left.len() {
+            for j in 1..=right.len() {
+                let substitution_cost = usize::from(left[i - 1] != right[j - 1]);
+                dist[i][j] = (dist[i - 1][j] + 1)
+                    .min(dist[i][j - 1] + 1)
+                    .min(dist[i - 1][j - 1] + substitution_cost);
+                if transposition_cost_one
+                    && i > 1
+                    && j > 1
+                    && left[i - 1] == right[j - 2]
+                    && left[i - 2] == right[j - 1]
+                {
+                    dist[i][j] = dist[i][j].min(dist[i - 2][j - 2] + 1);
+                }
+            }
+        }
+        dist[left.len()][right.len()]
+    }
+
+    fn prefix_distance(term: &str, query: &str, transposition_cost_one: bool) -> usize {
+        let term_chars: Vec<char> = term.chars().collect();
+        let query_chars: Vec<char> = query.chars().collect();
+        (0..=term_chars.len())
+            .map(|len| osa_distance(&term_chars[..len], &query_chars, transposition_cost_one))
+            .min()
+            .unwrap()
+    }
+
+    fn words(alphabet: &[char], len: usize) -> Vec<String> {
+        if len == 0 {
+            return vec![String::new()];
+        }
+        let mut result = Vec::new();
+        for word in words(alphabet, len - 1) {
+            for &c in alphabet {
+                let mut word = word.clone();
+                word.push(c);
+                result.push(word);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_fuzzy_prefix_agrees_with_osa_oracle() -> crate::Result<()> {
+        use tantivy_fst::Automaton;
+
+        let alphabet = ['a', 'b', 'c', 'ö'];
+        let terms = words(&alphabet, 3);
+        let queries = words(&alphabet, 3);
+        for &transposition_cost_one in &[false, true] {
+            for &distance in &[1u8, 2u8] {
+                for query in &queries {
+                    let field = crate::schema::Field::from_field_id(0);
+                    let query_term = Term::from_field_text(field, query);
+                    let automaton =
+                        FuzzyTermQuery::new_prefix(query_term, distance, transposition_cost_one)
+                            .automaton()?;
+                    for term in &terms {
+                        let mut state = automaton.start();
+                        for byte in term.as_bytes() {
+                            state = automaton.accept(&state, *byte);
+                        }
+                        let expected = prefix_distance(term, query, transposition_cost_one)
+                            <= distance as usize;
+                        assert_eq!(
+                            automaton.is_match(&state),
+                            expected,
+                            "query={query:?} term={term:?} distance={distance} \
+                             transposition_cost_one={transposition_cost_one}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     pub fn test_fuzzy_automaton_streams_expanded_terms() -> crate::Result<()> {

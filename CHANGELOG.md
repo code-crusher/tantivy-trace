@@ -4,6 +4,10 @@ Tantivy Upcoming Release
 ## Breaking change
 - MSRV is now 1.91, required by the `onpair` crate [#3179](https://github.com/quickwit-oss/tantivy/pull/3179)(@fulmicoton-dd)
 - `DynamicColumn` has new `PlainStr` and `PlainBytes` variants; exhaustive matches on `DynamicColumn` need new arms [#3179](https://github.com/quickwit-oss/tantivy/pull/3179)(@fulmicoton-dd)
+- The `Automaton::State` of `DfaWrapper` is now the opaque `DfaState` instead of `u32` [#3200](https://github.com/quickwit-oss/tantivy/issues/3200)
+
+## Bugfixes
+- Fix `FuzzyTermQuery::new_prefix` missing terms whose best prefix is within the distance when later characters push the full term above it [#3200](https://github.com/quickwit-oss/tantivy/issues/3200)
 
 
 Tantivy 0.27.0

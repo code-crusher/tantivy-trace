@@ -419,7 +419,7 @@ fn test_automaton_search() -> crate::Result<()> {
 
     // We can now build an entire dfa.
     let lev_automaton_builder = LevenshteinAutomatonBuilder::new(2, true);
-    let automaton = DfaWrapper(lev_automaton_builder.build_dfa("Spaen"));
+    let automaton = DfaWrapper::new(lev_automaton_builder.build_dfa("Spaen"), false);
 
     let mut range = term_dict.search(automaton).into_stream()?;
 
