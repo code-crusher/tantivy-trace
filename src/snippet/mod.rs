@@ -103,7 +103,7 @@ impl FragmentCandidate {
     fn try_add_token(&mut self, token: &Token, terms: &BTreeMap<String, Score>) {
         self.stop_offset = self.stop_offset.max(token.offset_to);
 
-        if let Some(&score) = terms.get(&token.text.to_lowercase()) {
+        if let Some(&score) = terms.get(&token.text) {
             self.score += score;
             self.highlighted.push(token.offset_from..token.offset_to);
         }
@@ -505,8 +505,16 @@ mod tests {
     use crate::query::QueryParser;
     use crate::schema::{Schema, TEXT};
     use crate::snippet::SnippetGenerator;
-    use crate::tokenizer::{NgramTokenizer, SimpleTokenizer, Token};
+    use crate::tokenizer::{LowerCaser, NgramTokenizer, SimpleTokenizer, TextAnalyzer, Token};
     use crate::Index;
+
+    /// A `SimpleTokenizer` with a `LowerCaser` filter, mirroring the default
+    /// tokenizer used for `TEXT` fields.
+    fn lowered_simple_tokenizer() -> TextAnalyzer {
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .build()
+    }
 
     const TEST_TEXT: &str = r#"Rust is a systems programming language sponsored by
 Mozilla which describes it as a "safe, concurrent, practical language", supporting functional and
@@ -529,7 +537,7 @@ Survey in 2016, 2017, and 2018."#;
             String::from("language") => 0.9
         };
         let fragments = search_fragments(
-            &mut From::from(SimpleTokenizer::default()),
+            &mut lowered_simple_tokenizer(),
             TEST_TEXT,
             &terms,
             100,
@@ -551,6 +559,46 @@ Survey in 2016, 2017, and 2018."#;
             "<b>Rust</b> is a systems programming <b>language</b> sponsored by\nMozilla which \
              describes it as a &quot;safe"
         )
+    }
+
+    #[test]
+    fn test_snippet_with_case_preserving_tokenizer() {
+        use crate::collector::Count;
+        use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        use crate::tokenizer::{TextAnalyzer, WhitespaceTokenizer};
+
+        fn highlight(text: &str, query: &str) -> (usize, String) {
+            let mut schema_builder = Schema::builder();
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer("whitespace")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+            let text_field = schema_builder
+                .add_text_field("text", TextOptions::default().set_indexing_options(indexing));
+            let index = Index::create_in_ram(schema_builder.build());
+            index.tokenizers().register(
+                "whitespace",
+                TextAnalyzer::from(WhitespaceTokenizer::default()),
+            );
+            let mut writer = index.writer_with_num_threads(1, 20_000_000).unwrap();
+            writer.add_document(doc!(text_field => text)).unwrap();
+            writer.commit().unwrap();
+            let searcher = index.reader().unwrap().searcher();
+            let query = QueryParser::for_index(&index, vec![text_field])
+                .parse_query(query)
+                .unwrap();
+            let hits = searcher.search(&*query, &Count).unwrap();
+            let generator = SnippetGenerator::create(&searcher, &*query, text_field).unwrap();
+            (hits, generator.snippet(text).to_html())
+        }
+
+        // A capitalised query term must highlight the capitalised occurrence.
+        let (hits, html) = highlight("foo, bar! Baz", "Baz");
+        assert_eq!(hits, 1);
+        assert_eq!(html, "foo, bar! <b>Baz</b>");
+        // A lowercase query term must not highlight the capitalised occurrence.
+        let (hits, html) = highlight("foo Baz baz", "baz");
+        assert_eq!(hits, 1);
+        assert_eq!(html, "foo Baz <b>baz</b>");
     }
 
     #[test]
@@ -579,7 +627,7 @@ Survey in 2016, 2017, and 2018."#;
                 String::from("language") => 0.9
             };
             let fragments = search_fragments(
-                &mut From::from(SimpleTokenizer::default()),
+                &mut lowered_simple_tokenizer(),
                 TEST_TEXT,
                 &terms,
                 20,
@@ -598,7 +646,7 @@ Survey in 2016, 2017, and 2018."#;
                 String::from("language") => 1.0
             };
             let fragments = search_fragments(
-                &mut From::from(SimpleTokenizer::default()),
+                &mut lowered_simple_tokenizer(),
                 TEST_TEXT,
                 &terms,
                 20,
@@ -888,7 +936,7 @@ Survey in 2016, 2017, and 2018."#;
     fn test_snippet_generator_custom_highlighted_elements() {
         let terms = btreemap! { String::from("rust") => 1.0, String::from("language") => 0.9 };
         let fragments = search_fragments(
-            &mut From::from(SimpleTokenizer::default()),
+            &mut lowered_simple_tokenizer(),
             TEST_TEXT,
             &terms,
             100,
