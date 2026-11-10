@@ -10,28 +10,46 @@ use crate::TantivyError::InvalidArgument;
 ///
 /// Obtained from [`FuzzyTermQuery::automaton`], e.g. to stream the term dictionary
 /// and collect the terms the query expands to.
-pub struct DfaWrapper(pub(crate) DFA);
+///
+/// The underlying DFA tracks the Levenshtein distance between the query term and
+/// the longest prefix of the candidate term consumed so far. For prefix queries
+/// however, a shorter prefix of the candidate may be within the distance while
+/// the full candidate is not (#3200): once that happens, the candidate must be
+/// reported as a match, no matter which bytes follow. A plain DFA cannot express
+/// that, so the wrapper carries a `matched` flag alongside the DFA state, which is
+/// set as soon as the DFA reports an exact distance and then never reset.
+pub struct DfaWrapper {
+    dfa: DFA,
+    prefix: bool,
+}
+
+impl DfaWrapper {
+    pub(crate) fn new(dfa: DFA, prefix: bool) -> Self {
+        Self { dfa, prefix }
+    }
+}
 
 impl Automaton for DfaWrapper {
-    type State = u32;
+    type State = (u32, bool);
 
     fn start(&self) -> Self::State {
-        self.0.initial_state()
+        (self.dfa.initial_state(), false)
     }
 
     fn is_match(&self, state: &Self::State) -> bool {
-        match self.0.distance(*state) {
-            Distance::Exact(_) => true,
-            Distance::AtLeast(_) => false,
-        }
+        state.1 || matches!(self.dfa.distance(state.0), Distance::Exact(_))
     }
 
-    fn can_match(&self, state: &u32) -> bool {
-        *state != levenshtein_automata::SINK_STATE
+    fn can_match(&self, state: &Self::State) -> bool {
+        state.1 || state.0 != levenshtein_automata::SINK_STATE
     }
 
     fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
-        self.0.transition(*state, byte)
+        let dfa_state = self.dfa.transition(state.0, byte);
+        let matched = state.1
+            || (self.prefix
+                && matches!(self.dfa.distance(dfa_state), Distance::Exact(_)));
+        (dfa_state, matched)
     }
 }
 
@@ -171,12 +189,12 @@ impl FuzzyTermQuery {
                 InvalidArgument("The fuzzy term query requires a string term.".to_string())
             })?
         };
-        let automaton = if self.prefix {
+        let dfa = if self.prefix {
             automaton_builder.build_prefix_dfa(term_text)
         } else {
             automaton_builder.build_dfa(term_text)
         };
-        Ok(DfaWrapper(automaton))
+        Ok(DfaWrapper::new(dfa, self.prefix))
     }
 
     fn specialized_weight(&self) -> crate::Result<AutomatonWeight<DfaWrapper>> {
@@ -390,6 +408,80 @@ mod test {
             let count = searcher.search(&fuzzy_query_transposition, &Count)?;
             assert_eq!(count, 0);
         }
+        Ok(())
+    }
+
+    /// The prefix automaton must keep matching a term once one of its prefixes is
+    /// within the distance, even if the full term is not (#3200).
+    #[test]
+    pub fn test_fuzzy_prefix_stays_matched() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let name_field = schema_builder.add_text_field("name", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        // "bd" (a prefix of "bdaa") is "bacd" without "a" and "c": two edits.
+        index_writer.add_document(doc!(name_field => "bdaa"))?;
+        // No prefix of "zzzz" is within two edits of "bacd".
+        index_writer.add_document(doc!(name_field => "zzzz"))?;
+        // The full term "bd" itself is within two edits.
+        index_writer.add_document(doc!(name_field => "bd"))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let query = FuzzyTermQuery::new_prefix(Term::from_field_text(name_field, "bacd"), 2, true);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
+        assert_eq!(top_docs.len(), 2, "Expected bdaa and bd to match, not zzzz");
+        Ok(())
+    }
+
+    /// Same as [`test_fuzzy_prefix_stays_matched`], with transpositions costing two.
+    #[test]
+    pub fn test_fuzzy_prefix_stays_matched_no_transposition() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let name_field = schema_builder.add_text_field("name", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        // "ö" (a prefix of "ödd") is "caö" without "c" and "a": two edits.
+        index_writer.add_document(doc!(name_field => "ödd"))?;
+        // No prefix of "zzz" is within two edits of "caö".
+        index_writer.add_document(doc!(name_field => "zzz"))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let query = FuzzyTermQuery::new_prefix(Term::from_field_text(name_field, "caö"), 2, false);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
+        assert_eq!(top_docs.len(), 1, "Expected only ödd to match, not zzz");
+        Ok(())
+    }
+
+    /// Distance-2 prefix queries whose match is decided by the full term must
+    /// still be reported, and non-matching terms must still be filtered out.
+    #[test]
+    pub fn test_fuzzy_prefix_stream_matches_early_prefixes() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let name_field = schema_builder.add_text_field("name", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        for term in ["bd", "bda", "bdaa", "bdaax", "bdzz", "zzzz"] {
+            index_writer.add_document(doc!(name_field => term))?;
+        }
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let query = FuzzyTermQuery::new_prefix(Term::from_field_text(name_field, "bacd"), 2, true);
+        let automaton = query.automaton()?;
+        let inverted_index = searcher.segment_reader(0).inverted_index(name_field)?;
+        let mut stream = inverted_index.terms().search(automaton).into_stream()?;
+        let mut terms = Vec::new();
+        while stream.advance() {
+            terms.push(String::from_utf8(stream.key().to_vec()).unwrap());
+        }
+        // "bdzz" also matches (its prefix "bd" is within two edits of "bacd"),
+        // while "zzzz" has no prefix within two edits and must be absent.
+        assert_eq!(terms, vec!["bd", "bda", "bdaa", "bdaax", "bdzz"]);
         Ok(())
     }
 }
