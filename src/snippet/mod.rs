@@ -103,7 +103,7 @@ impl FragmentCandidate {
     fn try_add_token(&mut self, token: &Token, terms: &BTreeMap<String, Score>) {
         self.stop_offset = self.stop_offset.max(token.offset_to);
 
-        if let Some(&score) = terms.get(&token.text.to_lowercase()) {
+        if let Some(&score) = terms.get(&token.text) {
             self.score += score;
             self.highlighted.push(token.offset_from..token.offset_to);
         }
@@ -505,7 +505,7 @@ mod tests {
     use crate::query::QueryParser;
     use crate::schema::{Schema, TEXT};
     use crate::snippet::SnippetGenerator;
-    use crate::tokenizer::{NgramTokenizer, SimpleTokenizer, Token};
+    use crate::tokenizer::{LowerCaser, NgramTokenizer, SimpleTokenizer, TextAnalyzer, Token};
     use crate::Index;
 
     const TEST_TEXT: &str = r#"Rust is a systems programming language sponsored by
@@ -522,18 +522,22 @@ to the project are from community members.[15]
 Rust won first place for "most loved programming language" in the Stack Overflow Developer
 Survey in 2016, 2017, and 2018."#;
 
+    /// A `SimpleTokenizer` that lowercases, mimicking the tokenizer of a typical
+    /// text field. The query terms handed to the snippet generator are produced
+    /// by the field's tokenizer, so they are already normalized.
+    fn lowercased_simple_analyzer() -> TextAnalyzer {
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .build()
+    }
+
     #[test]
     fn test_snippet() {
         let terms = btreemap! {
             String::from("rust") => 1.0,
             String::from("language") => 0.9
         };
-        let fragments = search_fragments(
-            &mut From::from(SimpleTokenizer::default()),
-            TEST_TEXT,
-            &terms,
-            100,
-        );
+        let fragments = search_fragments(&mut lowercased_simple_analyzer(), TEST_TEXT, &terms, 100);
         assert_eq!(fragments.len(), 7);
         {
             let first = &fragments[0];
@@ -578,12 +582,8 @@ Survey in 2016, 2017, and 2018."#;
                 String::from("rust") =>1.0,
                 String::from("language") => 0.9
             };
-            let fragments = search_fragments(
-                &mut From::from(SimpleTokenizer::default()),
-                TEST_TEXT,
-                &terms,
-                20,
-            );
+            let fragments =
+                search_fragments(&mut lowercased_simple_analyzer(), TEST_TEXT, &terms, 20);
             {
                 let first = &fragments[0];
                 assert_eq!(first.score, 1.0);
@@ -597,12 +597,8 @@ Survey in 2016, 2017, and 2018."#;
                 String::from("rust") =>0.9,
                 String::from("language") => 1.0
             };
-            let fragments = search_fragments(
-                &mut From::from(SimpleTokenizer::default()),
-                TEST_TEXT,
-                &terms,
-                20,
-            );
+            let fragments =
+                search_fragments(&mut lowercased_simple_analyzer(), TEST_TEXT, &terms, 20);
             // assert_eq!(fragments.len(), 7);
             {
                 let first = &fragments[0];
@@ -810,6 +806,55 @@ Survey in 2016, 2017, and 2018."#;
         Ok(())
     }
 
+    #[test]
+    fn test_snippet_generator_with_case_preserving_tokenizer() -> crate::Result<()> {
+        use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        use crate::tokenizer::WhitespaceTokenizer;
+
+        let mut schema_builder = Schema::builder();
+        let indexing = TextFieldIndexing::default()
+            .set_tokenizer("whitespace")
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let text_field = schema_builder.add_text_field(
+            "text",
+            TextOptions::default().set_indexing_options(indexing),
+        );
+        let index = Index::create_in_ram(schema_builder.build());
+        index
+            .tokenizers()
+            .register("whitespace", TextAnalyzer::from(WhitespaceTokenizer::default()));
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => "foo, bar! Baz"))?;
+            index_writer.add_document(doc!(text_field => "foo Baz baz"))?;
+            index_writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+        let query_parser = QueryParser::for_index(&index, vec![text_field]);
+
+        // A capitalized query term only highlights the capitalized token.
+        let query = query_parser.parse_query("Baz")?;
+        let snippet_generator = SnippetGenerator::create(&searcher, &*query, text_field)?;
+        assert_eq!(
+            snippet_generator.snippet("foo, bar! Baz").to_html(),
+            "foo, bar! <b>Baz</b>"
+        );
+        assert_eq!(
+            snippet_generator.snippet("foo Baz baz").to_html(),
+            "foo <b>Baz</b> baz"
+        );
+
+        // A lowercase query term only highlights the lowercase token.
+        let query = query_parser.parse_query("baz")?;
+        let snippet_generator = SnippetGenerator::create(&searcher, &*query, text_field)?;
+        assert!(snippet_generator.snippet("foo, bar! Baz").is_empty());
+        assert_eq!(
+            snippet_generator.snippet("foo Baz baz").to_html(),
+            "foo Baz <b>baz</b>"
+        );
+        Ok(())
+    }
+
     #[cfg(feature = "stemmer")]
     #[test]
     fn test_snippet_generator() -> crate::Result<()> {
@@ -887,12 +932,7 @@ Survey in 2016, 2017, and 2018."#;
     #[test]
     fn test_snippet_generator_custom_highlighted_elements() {
         let terms = btreemap! { String::from("rust") => 1.0, String::from("language") => 0.9 };
-        let fragments = search_fragments(
-            &mut From::from(SimpleTokenizer::default()),
-            TEST_TEXT,
-            &terms,
-            100,
-        );
+        let fragments = search_fragments(&mut lowercased_simple_analyzer(), TEST_TEXT, &terms, 100);
         let mut snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
         assert_eq!(
             snippet.to_html(),

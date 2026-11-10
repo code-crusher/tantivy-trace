@@ -5,6 +5,9 @@ Tantivy Upcoming Release
 - MSRV is now 1.91, required by the `onpair` crate [#3179](https://github.com/quickwit-oss/tantivy/pull/3179)(@fulmicoton-dd)
 - `DynamicColumn` has new `PlainStr` and `PlainBytes` variants; exhaustive matches on `DynamicColumn` need new arms [#3179](https://github.com/quickwit-oss/tantivy/pull/3179)(@fulmicoton-dd)
 
+## Bugfixes
+- Fix `SnippetGenerator` not highlighting terms with capital letters on a case-preserving tokenizer, and highlighting both cases for a lowercase query term [#3203](https://github.com/quickwit-oss/tantivy/issues/3203)
+
 
 Tantivy 0.27.0
 ================================
