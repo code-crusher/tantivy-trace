@@ -16,9 +16,10 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::collector::tests::{TEST_COLLECTOR_WITHOUT_SCORE, TEST_COLLECTOR_WITH_SCORE};
+    use crate::collector::Count;
     use crate::index::Index;
-    use crate::query::{EnableScoring, QueryParser, Weight};
-    use crate::schema::{Schema, Term, TEXT};
+    use crate::query::{BooleanQuery, EnableScoring, Occur, Query, QueryParser, TermQuery, Weight};
+    use crate::schema::{IndexRecordOption, Schema, Term, TEXT};
     use crate::{assert_nearly_equals, DocAddress, DocId, IndexWriter, TERMINATED};
 
     pub fn create_index<S: AsRef<str>>(texts: &[S]) -> crate::Result<Index> {
@@ -394,6 +395,38 @@ pub(crate) mod tests {
         assert_eq!(&matching_docs(r#"text2:"the smith""#), &[3u32]);
         assert!(&matching_docs(r#"arr.text:"the smith""#).is_empty());
         assert_eq!(&matching_docs(r#"arr.text:"elliot smith""#), &[2]);
+        Ok(())
+    }
+
+    // Regression test for #3193: the phrase scorer is already positioned on its
+    // first match when it is used as an exclusion, so `seek_danger` may be
+    // called with a target that is smaller than `doc()`.
+    #[test]
+    pub fn test_excluded_phrase_after_first_candidate() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => "catfish recipe"))?;
+            index_writer.add_document(doc!(text_field => "fried catfish"))?;
+            index_writer.commit()?;
+        }
+
+        let term = |text: &str| Term::from_field_text(text_field, text);
+        let query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(term("catfish"), IndexRecordOption::Basic))
+                    as Box<dyn Query>,
+            ),
+            (
+                Occur::MustNot,
+                Box::new(PhraseQuery::new(vec![term("fried"), term("catfish")])),
+            ),
+        ]);
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.search(&query, &Count)?, 1);
         Ok(())
     }
 }

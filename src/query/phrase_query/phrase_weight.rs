@@ -203,4 +203,28 @@ mod tests {
         assert_eq!(danger_scorer.score(), regular_scorer.score());
         Ok(())
     }
+
+    // Regression test for #3193: the phrase scorer is positioned on its first
+    // match when created, so `seek_danger` can be called with a target behind
+    // `doc()`, e.g. when the phrase is used as an exclusion.
+    #[test]
+    fn test_phrase_scorer_seek_danger_behind_doc() -> crate::Result<()> {
+        let index = create_index(&["a c", "a b", "a b"])?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+        let phrase_query = PhraseQuery::new(vec![
+            Term::from_field_text(text_field, "a"),
+            Term::from_field_text(text_field, "b"),
+        ]);
+        let phrase_weight =
+            phrase_query.phrase_weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let mut scorer = phrase_weight.scorer(searcher.segment_reader(0), 1.0)?;
+        assert_eq!(scorer.doc(), 1);
+
+        assert_eq!(scorer.seek_danger(0), SeekDangerResult::SeekLowerBound(1));
+        assert_eq!(scorer.seek_danger(1), SeekDangerResult::Found);
+        assert_eq!(scorer.advance(), 2);
+        Ok(())
+    }
 }
