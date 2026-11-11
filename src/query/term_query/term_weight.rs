@@ -38,6 +38,11 @@ impl Weight for TermWeight {
         Ok(self.specialized_scorer(reader, boost)?.into_boxed_scorer())
     }
 
+    fn refutation_cost(&self) -> u64 {
+        // A term lookup in the term dictionary is cheap.
+        1
+    }
+
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
         match self.specialized_scorer(reader, 1.0)? {
             TermOrEmptyOrAllScorer::TermScorer(mut term_scorer) => {

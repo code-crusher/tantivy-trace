@@ -103,6 +103,18 @@ pub trait Weight: Send + Sync + 'static {
         Ok((seek_danger_result, scorer))
     }
 
+    /// Returns a relative estimate of the work needed to find out that the scorer for a
+    /// segment is empty.
+    ///
+    /// This is used to order the required clauses of a [`BooleanQuery`](crate::query::BooleanQuery)
+    /// so that cheap clauses get a chance to refute the intersection before an expensive
+    /// scorer is built. The values are only compared to each other, the unit is arbitrary.
+    ///
+    /// The default value is `10`, which is a neutral cost for weights that do not override it.
+    fn refutation_cost(&self) -> u64 {
+        10
+    }
+
     /// Returns an [`Explanation`] for the given document.
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation>;
 

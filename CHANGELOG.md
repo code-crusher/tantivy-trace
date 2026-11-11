@@ -5,6 +5,10 @@ Tantivy Upcoming Release
 - MSRV is now 1.91, required by the `onpair` crate [#3179](https://github.com/quickwit-oss/tantivy/pull/3179)(@fulmicoton-dd)
 - `DynamicColumn` has new `PlainStr` and `PlainBytes` variants; exhaustive matches on `DynamicColumn` need new arms [#3179](https://github.com/quickwit-oss/tantivy/pull/3179)(@fulmicoton-dd)
 
+## Performance
+- **Query**
+    - Build the `MUST` clauses of a `BooleanQuery` cheapest first, making the latency of a conjunction independent from the clause order [#3195](https://github.com/quickwit-oss/tantivy/issues/3195)
+
 
 Tantivy 0.27.0
 ================================

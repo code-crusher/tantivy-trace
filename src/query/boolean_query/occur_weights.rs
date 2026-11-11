@@ -40,6 +40,16 @@ impl OccurWeights {
         self.must.extend(should_weights);
     }
 
+    /// Stable-sorts the MUST weights by [`Weight::refutation_cost`].
+    ///
+    /// Building an intersection stops at the first empty scorer, so trying the cheapest
+    /// clauses first lets a selective clause refute the intersection before an expensive
+    /// scorer gets built. The sort is stable, so clauses with the same cost keep their
+    /// query order.
+    pub fn sort_must_by_refutation_cost(&mut self) {
+        self.must.sort_by_key(|weight| weight.refutation_cost());
+    }
+
     pub fn len(&self) -> usize {
         self.must.len() + self.should.len() + self.must_not.len()
     }
@@ -54,7 +64,7 @@ impl OccurWeights {
 #[cfg(test)]
 mod tests {
     use super::OccurWeights;
-    use crate::query::{EnableScoring, Occur, Query, TermQuery, Weight};
+    use crate::query::{AllQuery, EnableScoring, Occur, Query, RegexQuery, TermQuery, Weight};
     use crate::schema::{IndexRecordOption, Schema, TEXT};
     use crate::{Index, Term};
 
@@ -106,5 +116,41 @@ mod tests {
         weights.push(Occur::MustNot, term_weight(&searcher, "c"));
         let occurs: Vec<Occur> = weights.iter().map(|(occur, _)| occur).collect();
         assert_eq!(occurs, vec![Occur::Must, Occur::Should, Occur::MustNot]);
+    }
+
+    #[test]
+    fn test_sort_must_by_refutation_cost() {
+        let searcher = test_searcher();
+        let field = searcher.schema().get_field("text").unwrap();
+        let mut weights = OccurWeights::default();
+        // The regex walks the term dictionary, so it is the most expensive to refute.
+        weights.push(
+            Occur::Must,
+            RegexQuery::from_pattern(".*", field)
+                .unwrap()
+                .weight(EnableScoring::disabled_from_searcher(&searcher))
+                .unwrap(),
+        );
+        weights.push(Occur::Must, term_weight(&searcher, "a"));
+        // An all query can never refute anything, but building it is free.
+        weights.push(
+            Occur::Must,
+            AllQuery
+                .weight(EnableScoring::disabled_from_searcher(&searcher))
+                .unwrap(),
+        );
+        weights.push(Occur::Should, term_weight(&searcher, "b"));
+
+        weights.sort_must_by_refutation_cost();
+
+        let costs: Vec<u64> = weights
+            .get(Occur::Must)
+            .iter()
+            .map(|weight| weight.refutation_cost())
+            .collect();
+        assert_eq!(costs, vec![0, 1, 1_000]);
+        // Sorting MUST does not touch the other buckets.
+        assert_eq!(weights.get(Occur::Should).len(), 1);
+        assert!(weights.get(Occur::MustNot).is_empty());
     }
 }

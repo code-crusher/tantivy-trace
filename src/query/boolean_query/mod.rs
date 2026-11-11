@@ -13,14 +13,16 @@ pub use self::boolean_weight::BooleanWeight;
 mod tests {
 
     use std::ops::Bound;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
 
     use super::*;
     use crate::collector::tests::TEST_COLLECTOR_WITH_SCORE;
     use crate::collector::{Count, TopDocs};
     use crate::query::term_query::TermScorer;
     use crate::query::{
-        AllScorer, EmptyScorer, EnableScoring, Intersection, Occur, Query, QueryParser, RangeQuery,
-        RequiredOptionalScorer, Scorer, SumCombiner, TermQuery,
+        AllScorer, EmptyScorer, EnableScoring, Explanation, Intersection, Occur, Query,
+        QueryParser, RangeQuery, RequiredOptionalScorer, Scorer, SumCombiner, TermQuery, Weight,
     };
     use crate::schema::*;
     use crate::{assert_nearly_equals, DocAddress, DocId, Index, IndexWriter, Score};
@@ -672,6 +674,193 @@ mod tests {
             "AllScorer in both MUST and SHOULD"
         );
 
+        Ok(())
+    }
+
+    /// A query that reports a fixed refutation cost and counts how many times its scorer is
+    /// built.
+    #[derive(Clone, Debug)]
+    struct CountingQuery {
+        scorer_builds: Arc<AtomicUsize>,
+        refutation_cost: u64,
+    }
+
+    impl Query for CountingQuery {
+        fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    impl Weight for CountingQuery {
+        fn refutation_cost(&self) -> u64 {
+            self.refutation_cost
+        }
+
+        fn scorer(
+            &self,
+            _reader: &crate::SegmentReader,
+            _boost: Score,
+        ) -> crate::Result<Box<dyn Scorer>> {
+            self.scorer_builds.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Box::new(EmptyScorer))
+        }
+
+        fn explain(
+            &self,
+            _reader: &crate::SegmentReader,
+            doc: DocId,
+        ) -> crate::Result<Explanation> {
+            Err(crate::query::explanation::does_not_match(doc))
+        }
+    }
+
+    #[test]
+    fn test_boolean_query_builds_cheapest_must_clause_first() -> crate::Result<()> {
+        let (index, _) = aux_test_helper()?;
+        let searcher = index.reader()?.searcher();
+        let expensive_builds = Arc::new(AtomicUsize::new(0));
+        let cheap_builds = Arc::new(AtomicUsize::new(0));
+
+        // The expensive clause comes first in the query, but the cheap one is built first
+        // and refutes the intersection, so the expensive scorer is never built.
+        let expensive: Box<dyn Query> = Box::new(CountingQuery {
+            scorer_builds: expensive_builds.clone(),
+            refutation_cost: 1_000,
+        });
+        let cheap: Box<dyn Query> = Box::new(CountingQuery {
+            scorer_builds: cheap_builds.clone(),
+            refutation_cost: 1,
+        });
+        let query = BooleanQuery::new(vec![(Occur::Must, expensive), (Occur::Must, cheap)]);
+
+        assert_eq!(searcher.search(&query, &Count)?, 0);
+        assert_eq!(cheap_builds.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(expensive_builds.load(AtomicOrdering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_boolean_query_clause_order_does_not_change_results() -> crate::Result<()> {
+        let (index, text_field) = aux_test_helper()?;
+        let searcher = index.reader()?.searcher();
+        let term_a: Box<dyn Query> = Box::new(TermQuery::new(
+            Term::from_field_text(text_field, "a"),
+            IndexRecordOption::Basic,
+        ));
+        let term_b: Box<dyn Query> = Box::new(TermQuery::new(
+            Term::from_field_text(text_field, "b"),
+            IndexRecordOption::Basic,
+        ));
+        let term_missing: Box<dyn Query> = Box::new(TermQuery::new(
+            Term::from_field_text(text_field, "missing"),
+            IndexRecordOption::Basic,
+        ));
+        let regex: Box<dyn Query> =
+            Box::new(crate::query::RegexQuery::from_pattern(".*a.*", text_field)?);
+
+        let forward = BooleanQuery::new(vec![
+            (Occur::Must, regex.box_clone()),
+            (Occur::Must, term_a.box_clone()),
+            (Occur::Must, term_missing.box_clone()),
+        ]);
+        let backward = BooleanQuery::new(vec![
+            (Occur::Must, term_missing.box_clone()),
+            (Occur::Must, term_a.box_clone()),
+            (Occur::Must, regex.box_clone()),
+        ]);
+        assert_eq!(searcher.search(&forward, &Count)?, 0);
+        assert_eq!(searcher.search(&backward, &Count)?, 0);
+
+        let forward = BooleanQuery::new(vec![
+            (Occur::Must, regex.box_clone()),
+            (Occur::Must, term_a.box_clone()),
+            (Occur::Must, term_b.box_clone()),
+        ]);
+        let backward = BooleanQuery::new(vec![
+            (Occur::Must, term_b.box_clone()),
+            (Occur::Must, term_a.box_clone()),
+            (Occur::Must, regex.box_clone()),
+        ]);
+        let forward_docs = searcher.search(&forward, &TopDocs::with_limit(10).order_by_score())?;
+        let backward_docs =
+            searcher.search(&backward, &TopDocs::with_limit(10).order_by_score())?;
+        assert_eq!(forward_docs, backward_docs);
+        Ok(())
+    }
+
+    #[test]
+    fn test_boolean_weight_refutation_cost() -> crate::Result<()> {
+        let (index, text_field) = aux_test_helper()?;
+        let searcher = index.reader()?.searcher();
+        let term_weight = |text: &str| -> crate::Result<Box<dyn Weight>> {
+            TermQuery::new(
+                Term::from_field_text(text_field, text),
+                IndexRecordOption::Basic,
+            )
+            .weight(EnableScoring::disabled_from_searcher(&searcher))
+        };
+        let regex_weight = || -> crate::Result<Box<dyn Weight>> {
+            Ok(crate::query::RegexQuery::from_pattern(".*a.*", text_field)?
+                .weight(EnableScoring::disabled_from_searcher(&searcher))?)
+        };
+        let all_weight = || -> crate::Result<Box<dyn Weight>> {
+            crate::query::AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))
+        };
+        let boolean_weight = |weights: Vec<(Occur, Box<dyn Weight>)>| -> Box<dyn Weight> {
+            Box::new(
+                BooleanWeight::<SumCombiner>::with_minimum_number_should_match(
+                    weights,
+                    0,
+                    false,
+                    Box::new(SumCombiner::default),
+                ),
+            )
+        };
+
+        // No MUST clause: the cost of the SHOULD clauses is summed.
+        let weight = boolean_weight(vec![
+            (Occur::Should, term_weight("a")?),
+            (Occur::Should, regex_weight()?),
+        ]);
+        assert_eq!(weight.refutation_cost(), 1_001);
+
+        // A MUST clause: the cheapest MUST clause decides the cost.
+        let weight = boolean_weight(vec![
+            (Occur::Must, regex_weight()?),
+            (Occur::Must, term_weight("a")?),
+            (Occur::Should, regex_weight()?),
+        ]);
+        assert_eq!(weight.refutation_cost(), 1);
+
+        // All and empty queries are free to refute.
+        let weight = boolean_weight(vec![
+            (Occur::Must, term_weight("a")?),
+            (Occur::Must, all_weight()?),
+        ]);
+        assert_eq!(weight.refutation_cost(), 0);
+        let weight = boolean_weight(vec![
+            (Occur::Must, term_weight("a")?),
+            (
+                Occur::Must,
+                crate::query::EmptyQuery
+                    .weight(EnableScoring::disabled_from_searcher(&searcher))?,
+            ),
+        ]);
+        assert_eq!(weight.refutation_cost(), 0);
+
+        // Wrappers forward the cost of the inner weight.
+        let weight = boolean_weight(vec![
+            (
+                Occur::Must,
+                crate::query::BoostQuery::new(
+                    Box::new(crate::query::RegexQuery::from_pattern(".*a.*", text_field)?),
+                    2.0,
+                )
+                .weight(EnableScoring::disabled_from_searcher(&searcher))?,
+            ),
+            (Occur::Must, term_weight("a")?),
+        ]);
+        assert_eq!(weight.refutation_cost(), 1);
         Ok(())
     }
 }

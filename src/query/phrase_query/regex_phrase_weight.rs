@@ -266,6 +266,11 @@ impl RegexPhraseWeight {
 }
 
 impl Weight for RegexPhraseWeight {
+    fn refutation_cost(&self) -> u64 {
+        // Building the scorer walks part of the term dictionary and collects postings.
+        1_000
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         if let Some(scorer) = self.phrase_scorer(reader, boost)? {
             Ok(Box::new(scorer))

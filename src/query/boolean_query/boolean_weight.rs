@@ -277,7 +277,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         // and the number of should clauses.
         let num_should_weights = per_occur_weights.get(Occur::Should).len();
 
-        match num_should_weights.cmp(&minimum_number_should_match) {
+        let mut boolean_weight = match num_should_weights.cmp(&minimum_number_should_match) {
             Ordering::Greater => {
                 // nothing to do. We will need the minimum should match logic.
                 BooleanWeight {
@@ -307,7 +307,15 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     score_combiner_fn,
                 }
             }
-        }
+        };
+
+        // Build the cheapest MUST clauses first, so that a cheap clause can refute the
+        // intersection before an expensive scorer is built.
+        boolean_weight
+            .per_occur_weights
+            .sort_must_by_refutation_cost();
+
+        boolean_weight
     }
 
     fn complex_scorer<TComplexScoreCombiner: ScoreCombiner>(
@@ -550,6 +558,25 @@ fn remove_and_count_all_and_empty_scorers(
 }
 
 impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
+    fn refutation_cost(&self) -> u64 {
+        let must_weights = self.per_occur_weights.get(Occur::Must);
+        if !must_weights.is_empty() {
+            // Building the intersection stops at the first empty scorer, so the cheapest
+            // MUST clause decides the cost.
+            return must_weights
+                .iter()
+                .map(|weight| weight.refutation_cost())
+                .min()
+                .unwrap_or(0);
+        }
+        // Without a MUST clause, all SHOULD scorers have to be built.
+        self.per_occur_weights
+            .get(Occur::Should)
+            .iter()
+            .map(|weight| weight.refutation_cost())
+            .sum()
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let num_docs = reader.num_docs();
         let num_sub_weights: usize = self.per_occur_weights.len();

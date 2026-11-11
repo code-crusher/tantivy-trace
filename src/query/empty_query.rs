@@ -30,6 +30,10 @@ impl Weight for EmptyWeight {
         Ok(Box::new(EmptyScorer))
     }
 
+    fn refutation_cost(&self) -> u64 {
+        0
+    }
+
     fn explain(&self, _reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
         Err(does_not_match(doc))
     }

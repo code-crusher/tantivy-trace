@@ -217,6 +217,11 @@ impl InvertedIndexRangeWeight {
 }
 
 impl Weight for InvertedIndexRangeWeight {
+    fn refutation_cost(&self) -> u64 {
+        // Building the scorer walks part of the term dictionary and collects postings.
+        1_000
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let max_doc = reader.max_doc();
         let mut doc_bitset = BitSet::with_max_value(max_doc);
