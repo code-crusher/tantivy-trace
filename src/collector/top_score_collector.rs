@@ -233,6 +233,11 @@ impl TopDocs {
     /// method does not panic, but an explicit error will be returned at the moment of
     /// collection.
     ///
+    /// The field may also be a path within a fast JSON field (e.g. `attrs.due` for a JSON field
+    /// `attrs`). Since the type of such a path is only known per segment, it is not checked
+    /// upfront: documents of segments where the path is missing, or holds a value of another
+    /// type, get `None` as their sort key.
+    ///
     /// Note that this method is a generic. The requested fast field type will be often
     /// inferred in your code by the rust compiler.
     ///

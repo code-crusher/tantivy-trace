@@ -402,6 +402,24 @@ impl Schema {
         }
         Some((field, json_path))
     }
+
+    /// Resolves a user-supplied fast field name into a path within a JSON field.
+    ///
+    /// For instance, `attributes.color` is resolved into the JSON field `attributes`
+    /// and the path `color`.
+    ///
+    /// Returns `None` if `full_path` does not target a (sub-)path of a JSON field.
+    pub(crate) fn find_json_field_path<'a>(
+        &'a self,
+        full_path: &'a str,
+        default_field_opt: Option<Field>,
+    ) -> Option<(Field, &'a str)> {
+        let (field, json_path) = self.find_field_with_default(full_path, default_field_opt)?;
+        if json_path.is_empty() {
+            return None;
+        }
+        Some((field, json_path))
+    }
 }
 
 impl Serialize for Schema {

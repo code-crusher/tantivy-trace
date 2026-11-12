@@ -31,12 +31,28 @@ impl FastFieldReaders {
     }
 
     fn resolve_field(&self, column_name: &str) -> crate::Result<Option<String>> {
-        let default_field_opt: Option<Field> = if cfg!(feature = "quickwit") {
+        self.resolve_column_name_given_default_field(column_name, self.default_field_opt())
+    }
+
+    /// The default field used to resolve user-supplied fast field names that are not in the
+    /// schema. (This is used by Quickwit, with its `_dynamic` field.)
+    fn default_field_opt(&self) -> Option<Field> {
+        if cfg!(feature = "quickwit") {
             self.schema.get_field("_dynamic").ok()
         } else {
             None
-        };
-        self.resolve_column_name_given_default_field(column_name, default_field_opt)
+        }
+    }
+
+    /// Returns whether the given fast field name targets a path within a JSON field (e.g.
+    /// `attributes.color` for a JSON field `attributes`), as opposed to a regular
+    /// schema-defined fast field.
+    ///
+    /// Sorting by such a path must be lenient: a segment may not contain the path at all.
+    pub(crate) fn is_json_path(&self, column_name: &str) -> bool {
+        self.schema
+            .find_json_field_path(column_name, self.default_field_opt())
+            .is_some()
     }
 
     pub(crate) fn space_usage(&self) -> io::Result<PerFieldSpaceUsage> {

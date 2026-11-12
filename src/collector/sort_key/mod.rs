@@ -393,6 +393,137 @@ pub(crate) mod tests {
 
     use proptest::prelude::*;
 
+    /// Builds an index with one segment per document, holding a fast JSON field. Documents have
+    /// a `due` attribute that is absent from the last segment, and a `prio` string attribute.
+    fn make_json_index() -> crate::Result<Index> {
+        use crate::schema::FAST;
+        use crate::TantivyDocument;
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_json_field("attrs", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        let mut index_writer = index.writer_with_num_threads(1, 50_000_000)?;
+        for json in [
+            r#"{"attrs": {"due": 30, "prio": "b"}}"#,
+            r#"{"attrs": {"due": 10, "prio": "a"}}"#,
+            // No "due" in this segment.
+            r#"{"attrs": {"prio": "c"}}"#,
+        ] {
+            index_writer
+                .add_document(TantivyDocument::parse_json(&schema, json)?)?;
+            index_writer.commit()?;
+        }
+        Ok(index)
+    }
+
+    #[test]
+    fn test_order_by_json_path_i64() -> crate::Result<()> {
+        let index = make_json_index()?;
+        let searcher = index.reader()?.searcher();
+
+        let top_collector = TopDocs::with_limit(10).order_by_fast_field::<i64>("attrs.due", Order::Asc);
+        let top_docs: Vec<(Option<i64>, DocAddress)> = searcher.search(&AllQuery, &top_collector)?;
+        assert_eq!(
+            top_docs.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![Some(10), Some(30), None]
+        );
+
+        let top_collector = TopDocs::with_limit(10).order_by_fast_field::<i64>("attrs.due", Order::Desc);
+        let top_docs: Vec<(Option<i64>, DocAddress)> = searcher.search(&AllQuery, &top_collector)?;
+        assert_eq!(
+            top_docs.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![Some(30), Some(10), None]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_json_path_missing_in_segment() -> crate::Result<()> {
+        let index = make_json_index()?;
+        let searcher = index.reader()?.searcher();
+        // A path that no document contains at all is not an error: all sort keys are `None`.
+        let top_collector = TopDocs::with_limit(10).order_by_fast_field::<i64>("attrs.nope", Order::Asc);
+        let top_docs: Vec<(Option<i64>, DocAddress)> = searcher.search(&AllQuery, &top_collector)?;
+        assert_eq!(top_docs.len(), 3);
+        assert!(top_docs.iter().all(|(key, _)| key.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_json_path_mixed_numeric_types_across_segments() -> crate::Result<()> {
+        use crate::schema::FAST;
+        use crate::TantivyDocument;
+
+        // The `attrs.v` path is stored as `f64` in one segment and `i64` in others: values must
+        // still be compared correctly across segments.
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_json_field("attrs", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        let mut index_writer = index.writer_with_num_threads(1, 50_000_000)?;
+        for json in [
+            r#"{"attrs": {"v": -10}}"#,
+            r#"{"attrs": {"v": -2.5}}"#,
+            r#"{"attrs": {"v": 20}}"#,
+        ] {
+            index_writer
+                .add_document(TantivyDocument::parse_json(&schema, json)?)?;
+            index_writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+
+        let collector =
+            TopDocs::with_limit(10).order_by_fast_field::<f64>("attrs.v", Order::Asc);
+        let top_docs: Vec<(Option<f64>, _)> = searcher.search(&AllQuery, &collector)?;
+        assert_eq!(
+            top_docs.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![Some(-10.0), Some(-2.5), Some(20.0)]
+        );
+
+        let collector = TopDocs::with_limit(10).order_by_fast_field::<i64>("attrs.v", Order::Asc);
+        let top_docs: Vec<(Option<i64>, _)> = searcher.search(&AllQuery, &collector)?;
+        assert_eq!(
+            top_docs.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![Some(-10), Some(-2), Some(20)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_json_path_incompatible_types() -> crate::Result<()> {
+        use crate::collector::sort_key::SortByErasedType;
+        use crate::schema::FAST;
+        use crate::TantivyDocument;
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_json_field("attrs", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        let mut index_writer = index.writer_with_num_threads(1, 50_000_000)?;
+        index_writer
+            .add_document(TantivyDocument::parse_json(
+                &schema,
+                r#"{"attrs": {"x": 5}}"#,
+            )?)?;
+        index_writer
+            .add_document(TantivyDocument::parse_json(
+                &schema,
+                r#"{"attrs": {"x": "str"}}"#,
+            )?)?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let collector = TopDocs::with_limit(10)
+            .order_by((SortByErasedType::for_field("attrs.x"), Order::Asc));
+        let err = searcher.search(&AllQuery, &collector).unwrap_err();
+        assert!(
+            matches!(&err, crate::TantivyError::SchemaError(msg) if msg.contains("incompatible types")),
+            "unexpected error: {err:?}"
+        );
+        Ok(())
+    }
+
     proptest! {
     #[test]
     fn test_order_by_string_prop(

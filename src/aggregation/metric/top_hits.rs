@@ -235,10 +235,11 @@ impl TopHitsAggregationReq {
                     })
                     .filter(|name| pattern.is_match(name))
                     .collect::<Vec<_>>();
-                assert!(
-                    !fields.is_empty(),
-                    "No fields matched the glob '{field}' in docvalue_fields"
-                );
+                if fields.is_empty() {
+                    return Err(crate::TantivyError::SchemaError(format!(
+                        "No fields matched the glob '{field}' in docvalue_fields"
+                    )));
+                }
                 Ok(fields)
             })
             .collect::<crate::Result<Vec<_>>>()?
@@ -810,6 +811,35 @@ mod tests {
             })
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_hits_docvalue_fields_missing_field_is_an_error() -> crate::Result<()> {
+        let values = vec![1.0];
+        let index = get_test_index_from_values(false, &values)?;
+
+        let d: Aggregations = serde_json::from_value(json!({
+            "top_hits_req": {
+                "top_hits": {
+                    "size": 2,
+                    "sort": [{ "date": "desc" }],
+                    "docvalue_fields": ["missing_field"],
+                }
+            }
+        }))
+        .unwrap();
+
+        let collector = AggregationCollector::from_aggs(d, Default::default());
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let err = searcher
+            .search(&AllQuery, &collector)
+            .expect_err("sorting by a missing docvalue field should fail");
+        assert!(
+            err.to_string().contains("No fields matched the glob"),
+            "unexpected error: {err:?}"
+        );
         Ok(())
     }
 

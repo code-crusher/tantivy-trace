@@ -24,6 +24,10 @@ pub enum SortByErasedType {
 impl SortByErasedType {
     /// Creates a new sort key computer which will sort by the given fast field column, with type
     /// erasure.
+    ///
+    /// The field may also be a path within a fast JSON field (e.g. `attrs.due` for a JSON field
+    /// `attrs`). Documents of segments where the path is missing get `None` as their sort key.
+    /// A path holding values of incompatible types (e.g. numbers and strings) yields an error.
     pub fn for_field(column_name: impl ToString) -> Self {
         Self::Field(column_name.to_string())
     }
@@ -91,20 +95,20 @@ impl SortKeyComputer for SortByErasedType {
         let inner: Box<dyn ErasedSegmentSortKeyComputer> = match self {
             Self::Field(column_name) => {
                 let fast_fields = segment_reader.fast_fields();
+                // A JSON path (e.g. `attrs.due`) may be stored under different column types in
+                // different segments, and may be missing from a segment altogether. We detect
+                // the actual column type of this segment here, and are lenient if there is none.
+                let column_handles = fast_fields.dynamic_column_handles(column_name)?;
+                let column_type = detect_column_type(column_name, &column_handles, fast_fields)?;
+
                 // TODO: We currently double-open the column to avoid relying on the implementation
                 // details of `SortByString` or `SortByStaticFastValue`. Once
                 // https://github.com/quickwit-oss/tantivy/issues/2776 is resolved, we should
                 // consider directly constructing the appropriate `SegmentSortKeyComputer` type for
                 // the column that we open here.
-                let (_column, column_type) =
-                    fast_fields.u64_lenient(column_name)?.ok_or_else(|| {
-                        FastFieldNotAvailableError {
-                            field_name: column_name.to_owned(),
-                        }
-                    })?;
-
                 match column_type {
-                    ColumnType::Str => {
+                    None => Box::new(MissingColumnSegmentSortKeyComputer),
+                    Some(ColumnType::Str) => {
                         let computer = SortByString::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
                         Box::new(ErasedSegmentSortKeyComputerWrapper {
@@ -114,7 +118,7 @@ impl SortKeyComputer for SortByErasedType {
                             },
                         })
                     }
-                    ColumnType::Bytes => {
+                    Some(ColumnType::Bytes) => {
                         let computer = SortByBytes::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
                         Box::new(ErasedSegmentSortKeyComputerWrapper {
@@ -124,7 +128,7 @@ impl SortKeyComputer for SortByErasedType {
                             },
                         })
                     }
-                    ColumnType::U64 => {
+                    Some(ColumnType::U64) => {
                         let computer = SortByStaticFastValue::<u64>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
                         Box::new(ErasedSegmentSortKeyComputerWrapper {
@@ -134,7 +138,7 @@ impl SortKeyComputer for SortByErasedType {
                             },
                         })
                     }
-                    ColumnType::I64 => {
+                    Some(ColumnType::I64) => {
                         let computer = SortByStaticFastValue::<i64>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
                         Box::new(ErasedSegmentSortKeyComputerWrapper {
@@ -144,7 +148,7 @@ impl SortKeyComputer for SortByErasedType {
                             },
                         })
                     }
-                    ColumnType::F64 => {
+                    Some(ColumnType::F64) => {
                         let computer = SortByStaticFastValue::<f64>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
                         Box::new(ErasedSegmentSortKeyComputerWrapper {
@@ -154,7 +158,7 @@ impl SortKeyComputer for SortByErasedType {
                             },
                         })
                     }
-                    ColumnType::Bool => {
+                    Some(ColumnType::Bool) => {
                         let computer = SortByStaticFastValue::<bool>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
                         Box::new(ErasedSegmentSortKeyComputerWrapper {
@@ -164,7 +168,7 @@ impl SortKeyComputer for SortByErasedType {
                             },
                         })
                     }
-                    ColumnType::DateTime => {
+                    Some(ColumnType::DateTime) => {
                         let computer = SortByStaticFastValue::<DateTime>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
                         Box::new(ErasedSegmentSortKeyComputerWrapper {
@@ -174,7 +178,7 @@ impl SortKeyComputer for SortByErasedType {
                             },
                         })
                     }
-                    column_type => {
+                    Some(column_type) => {
                         return Err(crate::TantivyError::SchemaError(format!(
                             "Field `{}` is of type {column_type:?}, which is not supported for \
                              sorting by owned value yet.",
@@ -188,6 +192,60 @@ impl SortKeyComputer for SortByErasedType {
             }),
         };
         Ok(ErasedColumnSegmentSortKeyComputer { inner })
+    }
+}
+
+/// Returns the column type to sort by, given the columns backing the field in this segment.
+///
+/// A JSON path is usually stored under a single type per segment, but nothing prevents a path
+/// from holding values of different types (e.g. numbers and strings) in different documents.
+/// Sorting by such a path is ambiguous, and returns an error instead.
+///
+/// Returns `Ok(None)` when no column backs the field in this segment, which is normal for a
+/// JSON path that no document of this segment contains.
+fn detect_column_type(
+    column_name: &str,
+    column_handles: &[columnar::DynamicColumnHandle],
+    fast_fields: &crate::fastfield::FastFieldReaders,
+) -> crate::Result<Option<ColumnType>> {
+    let mut column_types: Vec<ColumnType> =
+        column_handles.iter().map(|col| col.column_type()).collect();
+    column_types.sort();
+    column_types.dedup();
+    match column_types.len() {
+        0 => {
+            // A regular fast field is always backed by a column: if there is none, the field
+            // does not exist. A JSON path on the other hand may be missing from this segment,
+            // in which case all of its documents get `None` as their sort key.
+            if fast_fields.is_json_path(column_name) {
+                Ok(None)
+            } else {
+                Err(FastFieldNotAvailableError {
+                    field_name: column_name.to_owned(),
+                }
+                .into())
+            }
+        }
+        1 => Ok(column_types.pop()),
+        _ => Err(crate::TantivyError::SchemaError(format!(
+            "Field `{}` holds values of incompatible types {column_types:?}, and cannot be \
+             used for sorting.",
+            column_name
+        ))),
+    }
+}
+
+/// A segment sort key computer for a segment that does not contain the sorted field at all
+/// (e.g. a JSON path that no document of the segment contains).
+struct MissingColumnSegmentSortKeyComputer;
+
+impl ErasedSegmentSortKeyComputer for MissingColumnSegmentSortKeyComputer {
+    fn segment_sort_key(&mut self, _doc: DocId, _score: Score) -> Option<u64> {
+        None
+    }
+
+    fn convert_segment_sort_key(&self, _sort_key: Option<u64>) -> OwnedValue {
+        OwnedValue::Null
     }
 }
 
@@ -216,7 +274,7 @@ mod tests {
     use crate::collector::TopDocs;
     use crate::query::AllQuery;
     use crate::schema::{OwnedValue, Schema, FAST, TEXT};
-    use crate::Index;
+    use crate::{Index, Order};
 
     #[test]
     fn test_sort_by_owned_u64() {
@@ -375,6 +433,39 @@ mod tests {
             values,
             vec![OwnedValue::Null, OwnedValue::U64(2), OwnedValue::U64(10)]
         );
+    }
+
+    #[test]
+    fn test_sort_by_owned_json_path() -> crate::Result<()> {
+        use crate::schema::FAST;
+        use crate::TantivyDocument;
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_json_field("attrs", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        let mut writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
+        // One segment per document: the last one does not contain the `due` path at all.
+        for json in [
+            r#"{"attrs": {"due": 30}}"#,
+            r#"{"attrs": {"due": 10}}"#,
+            r#"{"attrs": {"prio": "c"}}"#,
+        ] {
+            writer
+                .add_document(TantivyDocument::parse_json(&schema, json).unwrap())
+                .unwrap();
+            writer.commit().unwrap();
+        }
+        let searcher = index.reader().unwrap().searcher();
+
+        let collector = TopDocs::with_limit(10)
+            .order_by((SortByErasedType::for_field("attrs.due"), Order::Asc));
+        let top_docs = searcher.search(&AllQuery, &collector).unwrap();
+        assert_eq!(
+            top_docs.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![OwnedValue::I64(10), OwnedValue::I64(30), OwnedValue::Null]
+        );
+        Ok(())
     }
 
     #[test]
