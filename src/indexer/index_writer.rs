@@ -308,7 +308,11 @@ impl<D: Document> IndexWriter<D> {
 
         let current_opstamp = index.load_metas()?.opstamp;
 
-        let stamper = Stamper::new(current_opstamp);
+        // The last commit purged deletes up to `current_opstamp`, so the new writer's
+        // operations must not reuse it: a delete stamped `current_opstamp` would look
+        // already-applied to segments with `delete_opstamp == current_opstamp` and
+        // could be skipped by a merge (see #3186).
+        let stamper = Stamper::new(current_opstamp + 1);
 
         let segment_updater = SegmentUpdater::create(
             index.clone(),
@@ -840,6 +844,7 @@ mod tests {
     use super::super::operation::UserOperation;
     use crate::collector::{Count, TopDocs};
     use crate::directory::error::LockError;
+    use crate::directory::RamDirectory;
     use crate::error::*;
     use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
     use crate::indexer::{IndexWriterOptions, NoMergePolicy};
@@ -865,7 +870,9 @@ mod tests {
 
     #[test]
     fn test_operations_group() {
-        // an operations group with 2 items should cause 3 opstamps 0, 1, and 2.
+        // an operations group with 2 items should cause 3 opstamps 1, 2, and 3:
+        // the stamper starts at `committed_opstamp + 1` (see #3186), which is 1 on a
+        // fresh index.
         let mut schema_builder = schema::Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
@@ -875,7 +882,7 @@ mod tests {
             UserOperation::Add(doc!(text_field=>"b")),
         ];
         let batch_opstamp1 = index_writer.run(operations).unwrap();
-        assert_eq!(batch_opstamp1, 2u64);
+        assert_eq!(batch_opstamp1, 3u64);
     }
 
     #[test]
@@ -978,10 +985,105 @@ mod tests {
         let index_writer: IndexWriter = index.writer_for_tests().unwrap();
         let operations1 = vec![];
         let batch_opstamp1 = index_writer.run(operations1).unwrap();
-        assert_eq!(batch_opstamp1, 0u64);
+        assert_eq!(batch_opstamp1, 1u64);
         let operations2 = vec![];
         let batch_opstamp2 = index_writer.run(operations2).unwrap();
-        assert_eq!(batch_opstamp2, 1u64);
+        assert_eq!(batch_opstamp2, 2u64);
+    }
+
+    #[test]
+    fn test_reopened_writer_first_opstamp_does_not_reuse_commit_opstamp() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let id_field = schema_builder.add_u64_field("id", INDEXED | STORED);
+        let body_field = schema_builder.add_text_field("body", TEXT);
+        let schema = schema_builder.build();
+        let directory = RamDirectory::create();
+
+        // Session 1: a last commit that ends with a delete, so that a segment
+        // carries `delete_opstamp == committed_opstamp`.
+        let index = Index::create(directory.clone(), schema.clone(), IndexSettings::default())?;
+        let committed_opstamp = {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(id_field => 1u64, body_field => "alpha"))?;
+            index_writer.add_document(doc!(id_field => 2u64, body_field => "beta"))?;
+            index_writer.commit()?;
+            index_writer.delete_term(Term::from_field_u64(id_field, 2u64));
+            index_writer.commit()?
+        };
+        assert!(committed_opstamp > 0);
+
+        // Session 2: reopening the index must not hand out the committed opstamp
+        // again. A delete stamped with it would be considered already applied by
+        // segments with `delete_opstamp == committed_opstamp` and could be
+        // skipped by a merge (see issue #3186).
+        let index = Index::open(directory)?;
+        let index_writer: IndexWriter = index.writer_for_tests()?;
+        let first_opstamp = index_writer.delete_term(Term::from_field_u64(id_field, 1u64));
+        assert!(first_opstamp > committed_opstamp);
+        Ok(())
+    }
+
+    #[test]
+    fn test_upsert_after_reopen_survives_merge() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let id_field = schema_builder.add_u64_field("id", INDEXED | STORED);
+        let body_field = schema_builder.add_text_field("body", TEXT);
+        let schema = schema_builder.build();
+        let directory = RamDirectory::create();
+
+        // Session 1: several small committed segments that were never merged,
+        // with a last commit that writes deletes into a segment, so that its
+        // `delete_opstamp` equals the committed opstamp.
+        {
+            let index = Index::create(directory.clone(), schema.clone(), IndexSettings::default())?;
+            let mut index_writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            for s in 0..7u64 {
+                for i in 0..8u64 {
+                    index_writer
+                        .add_document(doc!(id_field => 100 + s * 10 + i, body_field => "filler"))?;
+                }
+                index_writer.commit()?;
+            }
+            index_writer.add_document(doc!(id_field => 5u64, body_field => "gamma"))?;
+            for (id, body) in [(10u64, "alpha"), (11, "beta"), (12, "alpha"), (13, "beta")] {
+                index_writer.delete_term(Term::from_field_u64(id_field, id));
+                index_writer.add_document(doc!(id_field => id, body_field => body))?;
+            }
+            index_writer.delete_term(Term::from_field_u64(id_field, 12));
+            index_writer.add_document(doc!(id_field => 12u64, body_field => "beta"))?;
+            index_writer.delete_term(Term::from_field_u64(id_field, 13));
+            index_writer.commit()?;
+            index_writer.wait_merging_threads()?;
+        }
+
+        // Session 2: reopen with the default merge policy and upsert the same
+        // documents (delete then add). The first delete of the new writer used
+        // to be stamped with the last commit's opstamp and was skipped by the
+        // merge, leaving two copies of the document.
+        let index = Index::open(directory)?;
+        {
+            let mut index_writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+            index_writer.delete_term(Term::from_field_u64(id_field, 10));
+            index_writer.add_document(doc!(id_field => 10u64, body_field => "alpha"))?;
+            for (id, body) in [(11u64, "beta"), (12, "alpha"), (13, "beta")] {
+                index_writer.delete_term(Term::from_field_u64(id_field, id));
+                index_writer.add_document(doc!(id_field => id, body_field => body))?;
+            }
+            index_writer.delete_term(Term::from_field_u64(id_field, 12));
+            index_writer.add_document(doc!(id_field => 12u64, body_field => "beta"))?;
+            index_writer.delete_term(Term::from_field_u64(id_field, 13));
+            index_writer.commit()?;
+            index_writer.wait_merging_threads()?;
+        }
+
+        let searcher = index.reader()?.searcher();
+        let query = TermQuery::new(Term::from_field_u64(id_field, 10), IndexRecordOption::Basic);
+        let hits = searcher
+            .search(&query, &TopDocs::with_limit(10).order_by_score())?
+            .len();
+        assert_eq!(hits, 1);
+        Ok(())
     }
 
     #[test]
@@ -1313,7 +1415,9 @@ mod tests {
 
         // delete_all_documents the index
         let clear_tstamp = index_writer.delete_all_documents().unwrap();
-        assert_eq!(clear_tstamp, add_tstamp);
+        // `delete_all_documents` reverts the stamper to the last committed opstamp,
+        // which is 0 on a fresh index (the first opstamp is 1, see #3186).
+        assert_eq!(clear_tstamp, 0u64);
 
         // commit the clear command - now documents aren't available
         let second_commit = index_writer.commit();

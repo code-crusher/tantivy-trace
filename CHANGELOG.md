@@ -5,6 +5,9 @@ Tantivy Upcoming Release
 - MSRV is now 1.91, required by the `onpair` crate [#3179](https://github.com/quickwit-oss/tantivy/pull/3179)(@fulmicoton-dd)
 - `DynamicColumn` has new `PlainStr` and `PlainBytes` variants; exhaustive matches on `DynamicColumn` need new arms [#3179](https://github.com/quickwit-oss/tantivy/pull/3179)(@fulmicoton-dd)
 
+## Bugfixes
+- The first operation of a reopened `IndexWriter` no longer reuses the last commit's opstamp, so a delete that is the first operation of a new writer is no longer skipped by a merge and `delete_term` + `add_document` upserts no longer leave duplicate documents [#3186](https://github.com/quickwit-oss/tantivy/issues/3186)
+
 
 Tantivy 0.27.0
 ================================
