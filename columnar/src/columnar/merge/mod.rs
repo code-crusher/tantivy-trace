@@ -19,7 +19,7 @@ use crate::columnar::writer::CompatibleNumericalTypes;
 use crate::dynamic_column::DynamicColumn;
 use crate::{
     BytesColumn, Column, ColumnIndex, ColumnType, ColumnValues, DynamicColumnHandle, NumericalType,
-    NumericalValue,
+    NumericalValue, Version,
 };
 
 /// Column types are grouped into different categories.
@@ -87,6 +87,7 @@ pub fn merge_columnar(
         .collect::<Vec<u32>>();
 
     let columns_to_merge = group_columns_for_merge(columnar_readers, required_columns)?;
+    let mut wrote_full_block = false;
     for res in columns_to_merge {
         let ((column_name, _column_type_category), grouped_columns) = res;
         let grouped_columns = grouped_columns.open(&merge_row_order)?;
@@ -103,7 +104,7 @@ pub fn merge_columnar(
 
         let mut column_serializer =
             serializer.start_serialize_column(column_name.as_bytes(), column_type_after_merge);
-        merge_column(
+        wrote_full_block |= merge_column(
             column_type_after_merge,
             &num_docs_per_columnar,
             columns,
@@ -113,7 +114,7 @@ pub fn merge_columnar(
         column_serializer.finalize()?;
     }
 
-    serializer.finalize(merge_row_order.num_rows())?;
+    serializer.finalize(merge_row_order.num_rows(), wrote_full_block)?;
     Ok(())
 }
 
@@ -132,13 +133,16 @@ fn dynamic_column_to_u64_monotonic(dynamic_column: DynamicColumn) -> Option<Colu
     }
 }
 
+/// Merges the column, returning `true` if a full block was written.
+///
+/// See [`crate::column::serialize_column_mappable_to_u64`] for the semantics of the return value.
 fn merge_column(
     column_type: ColumnType,
     num_docs_per_column: &[u32],
     columns_to_merge: Vec<Option<DynamicColumn>>,
     merge_row_order: &MergeRowOrder,
     wrt: &mut impl io::Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     match column_type {
         ColumnType::I64
         | ColumnType::U64
@@ -169,7 +173,7 @@ fn merge_column(
                 column_values: &column_values[..],
                 merge_row_order,
             };
-            serialize_column_mappable_to_u64(merged_column_index, &merge_column_values, wrt)?;
+            serialize_column_mappable_to_u64(merged_column_index, &merge_column_values, Version::V4, wrt)
         }
         ColumnType::IpAddr => {
             let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns_to_merge.len());
@@ -197,7 +201,12 @@ fn merge_column(
                 merge_row_order,
             };
 
-            serialize_column_mappable_to_u128(merged_column_index, &merge_column_values, wrt)?;
+            serialize_column_mappable_to_u128(
+                merged_column_index,
+                &merge_column_values,
+                Version::V4,
+                wrt,
+            )
         }
         ColumnType::Bytes | ColumnType::Str => {
             let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns_to_merge.len());
@@ -229,10 +238,9 @@ fn merge_column(
             }
             let merged_column_index =
                 crate::column_index::merge_column_index(&column_indexes[..], merge_row_order);
-            merge_bytes_or_str_column(merged_column_index, &bytes_columns, merge_row_order, wrt)?;
+            merge_bytes_or_str_column(merged_column_index, &bytes_columns, merge_row_order, wrt)
         }
     }
-    Ok(())
 }
 
 struct GroupedColumns {

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::column_index::optional_index::set_block::dense::DENSE_BLOCK_NUM_BYTES;
-use crate::column_index::optional_index::set_block::{DenseBlockCodec, SparseBlockCodec};
+use crate::column_index::optional_index::set_block::{
+    DenseBlockCodec, FullBlockCodec, SparseBlockCodec,
+};
 use crate::column_index::optional_index::{SelectCursor, Set, SetCodec};
 
 fn test_set_helper<C: SetCodec<Item = u16>>(vals: &[u16]) -> usize {
@@ -50,6 +52,25 @@ fn test_sparse_block_set_u16_empty() {
 fn test_sparse_block_set_u16_max() {
     let buffer_len = test_set_helper::<SparseBlockCodec>(&[u16::MAX]);
     assert_eq!(buffer_len, 2);
+}
+
+#[test]
+fn test_full_block_set_u16() {
+    // A full block contains every element: rank and select are the identity.
+    let mut buffer = Vec::new();
+    FullBlockCodec::serialize(0u16..=u16::MAX, &mut buffer).unwrap();
+    assert!(buffer.is_empty());
+    let tested_set = FullBlockCodec::open(&buffer);
+    for el in [0u16, 1, 63, 64, 65_000, u16::MAX] {
+        assert!(tested_set.contains(el));
+        assert_eq!(tested_set.rank(el), el);
+        assert_eq!(tested_set.rank_if_exists(el), Some(el));
+        assert_eq!(tested_set.select(el), el);
+    }
+    let select_cursor = tested_set.select_cursor();
+    for rank in [0u16, 1, 63, 64, 65_000, u16::MAX] {
+        assert_eq!(select_cursor.select(rank), rank);
+    }
 }
 
 use proptest::prelude::*;

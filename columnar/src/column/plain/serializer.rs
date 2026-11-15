@@ -6,6 +6,7 @@ use std::io;
 use super::block::encode_block;
 use super::block_index::PlainBlockIndexBuilder;
 use super::{PLAIN_FOOTER_NUM_BYTES, PLAIN_FORMAT_VERSION};
+use crate::Version;
 use crate::column_index::{SerializableColumnIndex, serialize_column_index};
 
 /// A block is closed once it holds this many values.
@@ -112,7 +113,8 @@ impl<W: io::Write> PlainColumnSerializer<W> {
         let mut block_index_bytes = Vec::new();
         self.block_index.serialize(&mut block_index_bytes);
         self.wrt.write_all(&block_index_bytes)?;
-        let column_index_num_bytes = serialize_column_index(column_index, &mut self.wrt)?;
+        let (column_index_num_bytes, _) =
+            serialize_column_index(column_index, Version::V4, &mut self.wrt)?;
         let mut footer = [0u8; PLAIN_FOOTER_NUM_BYTES];
         footer[0..4].copy_from_slice(&(block_index_bytes.len() as u32).to_le_bytes());
         footer[4..8].copy_from_slice(&column_index_num_bytes.to_le_bytes());

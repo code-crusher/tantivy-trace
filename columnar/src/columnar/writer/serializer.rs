@@ -7,7 +7,9 @@ use sstable::RangeSSTable;
 use sstable::value::RangeValueWriter;
 
 use crate::RowId;
-use crate::columnar::format_version::{CURRENT_VERSION, PLAIN_CODEC_VERSION, footer_for_version};
+use crate::columnar::format_version::{
+    CURRENT_VERSION, FULL_BLOCK_VERSION, PLAIN_CODEC_VERSION, footer_for_version,
+};
 use crate::columnar::{ColumnType, StrColumnCodec, column_key_code};
 
 /// Serializes the columns of a columnar.
@@ -75,18 +77,23 @@ impl<W: io::Write> ColumnarSerializer<W> {
         }
     }
 
-    pub(crate) fn finalize(mut self, num_rows: RowId) -> io::Result<()> {
+    pub(crate) fn finalize(mut self, num_rows: RowId, wrote_full_block: bool) -> io::Result<()> {
         let sstable_bytes: Vec<u8> = self.sstable_range.finish()?;
         let sstable_num_bytes: u64 = sstable_bytes.len() as u64;
         self.wrt.write_all(&sstable_bytes)?;
         self.wrt.write_all(&sstable_num_bytes.to_le_bytes()[..])?;
         num_rows.serialize(&mut self.wrt)?;
-        // Columnars without plain columns keep the version they had before the plain codec
-        // existed, so that older readers can still open them.
+        // Columnars that do not use any newer feature keep the version they had before those
+        // features existed, so that older readers can still open them.
         let version = if self.has_plain_column {
             PLAIN_CODEC_VERSION
         } else {
             CURRENT_VERSION
+        };
+        let version = if wrote_full_block {
+            FULL_BLOCK_VERSION
+        } else {
+            version
         };
         self.wrt.write_all(&footer_for_version(version))?;
         self.wrt.flush()?;

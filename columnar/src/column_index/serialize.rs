@@ -41,26 +41,36 @@ impl SerializableColumnIndex<'_> {
     }
 }
 
-/// Serialize a column index.
+/// Serialize a column index, returning `(num_bytes, wrote_full_block)`.
+///
+/// `wrote_full_block` is `true` if the serialized index uses the full block encoding of the
+/// optional codec. The caller uses it to stamp the columnar format version, so that readers
+/// interpret the block correctly.
 pub fn serialize_column_index(
     column_index: SerializableColumnIndex,
+    format_version: Version,
     output: &mut impl Write,
-) -> io::Result<u32> {
+) -> io::Result<(u32, bool)> {
     let mut output = CountingWriter::wrap(output);
     let cardinality = column_index.get_cardinality().to_code();
     output.write_all(&[cardinality])?;
-    match column_index {
-        SerializableColumnIndex::Full => {}
+    let wrote_full_block = match column_index {
+        SerializableColumnIndex::Full => false,
         SerializableColumnIndex::Optional(SerializableOptionalIndex {
             non_null_row_ids,
             num_rows,
-        }) => serialize_optional_index(non_null_row_ids.as_ref(), num_rows, &mut output)?,
+        }) => serialize_optional_index(
+            non_null_row_ids.as_ref(),
+            num_rows,
+            format_version,
+            &mut output,
+        )?,
         SerializableColumnIndex::Multivalued(multivalued_index) => {
-            serialize_multivalued_index(&multivalued_index, &mut output)?
+            serialize_multivalued_index(&multivalued_index, format_version, &mut output)?
         }
-    }
+    };
     let column_index_num_bytes = output.written_bytes() as u32;
-    Ok(column_index_num_bytes)
+    Ok((column_index_num_bytes, wrote_full_block))
 }
 
 /// Open a serialized column index.
@@ -80,7 +90,7 @@ pub fn open_column_index(
     match cardinality {
         Cardinality::Full => Ok(ColumnIndex::Full),
         Cardinality::Optional => {
-            let optional_index = super::optional_index::open_optional_index(bytes)?;
+            let optional_index = super::optional_index::open_optional_index(bytes, format_version)?;
             Ok(ColumnIndex::Optional(optional_index))
         }
         Cardinality::Multivalued => {

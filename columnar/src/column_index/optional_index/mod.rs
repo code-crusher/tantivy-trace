@@ -7,11 +7,12 @@ mod set_block;
 use common::{BinarySerializable, OwnedBytes, VInt};
 pub use set::{SelectCursor, Set, SetCodec};
 use set_block::{
-    DENSE_BLOCK_NUM_BYTES, DenseBlock, DenseBlockCodec, SparseBlock, SparseBlockCodec,
+    DENSE_BLOCK_NUM_BYTES, DenseBlock, DenseBlockCodec, FullBlock, FullBlockCodec, SparseBlock,
+    SparseBlockCodec,
 };
 
 use crate::iterable::Iterable;
-use crate::{DocId, RowId};
+use crate::{DocId, RowId, Version};
 
 /// The threshold for for number of elements after which we switch to dense block encoding.
 ///
@@ -31,6 +32,7 @@ struct BlockMeta {
 #[derive(Clone, Copy, Debug)]
 enum BlockVariant {
     Dense,
+    Full,
     Sparse { num_vals: u16 },
 }
 
@@ -41,6 +43,7 @@ impl BlockVariant {
     pub fn num_bytes_in_block(&self) -> u32 {
         match *self {
             BlockVariant::Dense => set_block::DENSE_BLOCK_NUM_BYTES,
+            BlockVariant::Full => set_block::FULL_BLOCK_NUM_BYTES,
             BlockVariant::Sparse { num_vals } => num_vals as u32 * 2,
         }
     }
@@ -54,16 +57,20 @@ impl BlockVariant {
 /// id. Each block contains 1<<16 docids.
 ///
 /// # Serialized Data Layout
-/// The data starts with the block data. Each block is either dense or sparse encoded, depending on
-/// the number of values in the block. A block is sparse when it contains less than
-/// DENSE_BLOCK_THRESHOLD (6144) values.
-/// [Sparse data block | dense data block, .. #repeat*; Desc: Either a sparse or dense encoded
-/// block]
+/// The data starts with the block data. Each block is either sparse, dense or full encoded,
+/// depending on the number of values in the block. A block is sparse when it contains less than
+/// DENSE_BLOCK_THRESHOLD (6144) values. A block is full when it contains all ELEMENTS_PER_BLOCK
+/// (65536) values, provided the format version allows full blocks (see `Version::allows_full_block`).
+/// Full blocks store no data at all.
+/// [Sparse data block | dense data block | full data block, .. #repeat*; Desc: Either a sparse,
+/// dense or full encoded block]
 /// ### Sparse block data
 /// [u16 LE, .. #repeat*; Desc: Positions with values in a block]
 /// ### Dense block data
 /// [Dense codec for the whole block; Desc: Similar to a bitvec(0..ELEMENTS_PER_BLOCK) + Metadata
 /// for faster lookups. See dense.rs]
+/// ### Full block data
+/// [No data; Desc: Every element of 0..ELEMENTS_PER_BLOCK is present. See full.rs]
 ///
 /// The data is followed by block metadata, to know which area of the raw block data belongs to
 /// which block. Only metadata for blocks with elements is recorded to
@@ -120,6 +127,7 @@ fn row_addr_from_row_id(row_id: RowId) -> RowAddr {
 
 enum BlockSelectCursor<'a> {
     Dense(<DenseBlock<'a> as Set<u16>>::SelectCursor<'a>),
+    Full(<FullBlock as Set<u16>>::SelectCursor<'a>),
     Sparse(<SparseBlock<'a> as Set<u16>>::SelectCursor<'a>),
 }
 
@@ -127,6 +135,7 @@ impl BlockSelectCursor<'_> {
     fn select(&mut self, rank: u16) -> u16 {
         match self {
             BlockSelectCursor::Dense(dense_select_cursor) => dense_select_cursor.select(rank),
+            BlockSelectCursor::Full(full_select_cursor) => full_select_cursor.select(rank),
             BlockSelectCursor::Sparse(sparse_select_cursor) => sparse_select_cursor.select(rank),
         }
     }
@@ -160,6 +169,7 @@ impl OptionalIndexSelectCursor<'_> {
         let block: Block<'_> = self.optional_index.block(block_meta);
         self.current_block_cursor = match block {
             Block::Dense(dense_block) => BlockSelectCursor::Dense(dense_block.select_cursor()),
+            Block::Full(full_block) => BlockSelectCursor::Full(full_block.select_cursor()),
             Block::Sparse(sparse_block) => BlockSelectCursor::Sparse(sparse_block.select_cursor()),
         };
     }
@@ -187,6 +197,7 @@ impl Set<RowId> for OptionalIndex {
         let block_meta = self.block_metas[block_id as usize];
         match self.block(block_meta) {
             Block::Dense(dense_block) => dense_block.contains(in_block_row_id),
+            Block::Full(full_block) => full_block.contains(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.contains(in_block_row_id),
         }
     }
@@ -207,6 +218,7 @@ impl Set<RowId> for OptionalIndex {
 
         let block_offset_row_id = match block {
             Block::Dense(dense_block) => dense_block.rank(in_block_row_id),
+            Block::Full(full_block) => full_block.rank(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.rank(in_block_row_id),
         } as u32;
         block_meta.non_null_rows_before_block + block_offset_row_id
@@ -224,6 +236,7 @@ impl Set<RowId> for OptionalIndex {
         let block = self.block(block_meta);
         let block_offset_row_id = match block {
             Block::Dense(dense_block) => dense_block.rank_if_exists(in_block_row_id),
+            Block::Full(full_block) => full_block.rank_if_exists(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.rank_if_exists(in_block_row_id),
         }? as u32;
         Some(block_meta.non_null_rows_before_block + block_offset_row_id)
@@ -238,6 +251,7 @@ impl Set<RowId> for OptionalIndex {
         let index_in_block = (rank - block_meta.non_null_rows_before_block) as u16;
         let in_block_rank = match block {
             Block::Dense(dense_block) => dense_block.select(index_in_block),
+            Block::Full(full_block) => full_block.select(index_in_block),
             Block::Sparse(sparse_block) => sparse_block.select(index_in_block),
         };
         block_doc_idx_start + in_block_rank as u32
@@ -267,9 +281,9 @@ impl OptionalIndex {
                 .unwrap_or(true)
         );
         let mut buffer = Vec::new();
-        serialize_optional_index(&row_ids, num_rows, &mut buffer).unwrap();
+        let _ = serialize_optional_index(&row_ids, num_rows, Version::V4, &mut buffer).unwrap();
         let bytes = OwnedBytes::new(buffer);
-        open_optional_index(bytes).unwrap()
+        open_optional_index(bytes, Version::V4).unwrap()
     }
 
     pub fn num_docs(&self) -> RowId {
@@ -312,6 +326,13 @@ impl OptionalIndex {
                         if block.contains(in_block_doc as u16) {
                             return Some(block_start + in_block_doc);
                         }
+                    }
+                }
+                Block::Full(_) => {
+                    // All docs in the block have a value.
+                    let block_num_docs = (self.num_docs - block_start).min(ELEMENTS_PER_BLOCK);
+                    if (in_block_start as u32) < block_num_docs {
+                        return Some(block_start + in_block_start as u32);
                     }
                 }
             }
@@ -399,6 +420,7 @@ impl OptionalIndex {
             BlockVariant::Dense => Block::Dense(DenseBlockCodec::open(
                 &bytes[start_byte_offset..start_byte_offset + DENSE_BLOCK_NUM_BYTES as usize],
             )),
+            BlockVariant::Full => Block::Full(FullBlockCodec::open(&[])),
             BlockVariant::Sparse { num_vals } => {
                 let end_byte_offset = start_byte_offset + num_vals as usize * 2;
                 let sparse_bytes = &bytes[start_byte_offset..end_byte_offset];
@@ -425,6 +447,7 @@ impl OptionalIndex {
 #[derive(Copy, Clone)]
 enum Block<'a> {
     Dense(DenseBlock<'a>),
+    Full(FullBlock),
     Sparse(SparseBlock<'a>),
 }
 
@@ -443,6 +466,13 @@ impl Block<'_> {
                     }
                 }
             }
+            Block::Full(full_block) => {
+                for doc_id in doc_ids {
+                    if let Some(row_id) = full_block.rank_if_exists(doc_id) {
+                        collect(doc_id, row_id);
+                    }
+                }
+            }
             Block::Sparse(sparse_block) => {
                 sparse_block.rank_if_exists_batch(doc_ids, collect);
             }
@@ -450,32 +480,53 @@ impl Block<'_> {
     }
 }
 
-fn serialize_optional_index_block(block_els: &[u16], out: &mut impl io::Write) -> io::Result<()> {
-    let is_sparse = is_sparse(block_els.len() as u32);
-    if is_sparse {
+/// Serializes a block, returning `true` if the block was serialized as a full block.
+///
+/// Full blocks are only written when `format_version` allows them; older formats serialize the
+/// same data as a dense block.
+fn serialize_optional_index_block(
+    block_els: &[u16],
+    format_version: Version,
+    out: &mut impl io::Write,
+) -> io::Result<bool> {
+    if is_full(block_els.len() as u32) {
+        if format_version.allows_full_block() {
+            FullBlockCodec::serialize(block_els.iter().copied(), out)?;
+            return Ok(true);
+        }
+        // Older formats do not have full blocks: fall back to the dense encoding.
+    }
+    if is_sparse(block_els.len() as u32) {
         SparseBlockCodec::serialize(block_els.iter().copied(), out)?;
     } else {
         DenseBlockCodec::serialize(block_els.iter().copied(), out)?;
     }
-    Ok(())
+    Ok(false)
 }
 
+/// Serializes an optional index, returning `true` if a full block was written.
+///
+/// A full block is a block holding every element of `0..ELEMENTS_PER_BLOCK`; it is only written
+/// when `format_version` allows it. The caller uses the return value to stamp the columnar
+/// format version, so that readers know how to interpret the block.
 pub fn serialize_optional_index<W: io::Write>(
     non_null_rows: &dyn Iterable<RowId>,
     num_rows: RowId,
+    format_version: Version,
     output: &mut W,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     VInt(num_rows as u64).serialize(output)?;
 
     let mut rows_it = non_null_rows.boxed_iter();
     let mut block_metadata: Vec<SerializedBlockMeta> = Vec::new();
     let mut current_block = Vec::new();
+    let mut wrote_full_block = false;
 
     // This if-statement for the first element ensures that
     // `block_metadata` is not empty in the loop below.
     let Some(idx) = rows_it.next() else {
         output.write_all(&0u16.to_le_bytes())?;
-        return Ok(());
+        return Ok(false);
     };
 
     let row_addr = row_addr_from_row_id(idx);
@@ -486,7 +537,8 @@ pub fn serialize_optional_index<W: io::Write>(
     for idx in rows_it {
         let value_addr = row_addr_from_row_id(idx);
         if current_block_id != value_addr.block_id {
-            serialize_optional_index_block(&current_block[..], output)?;
+            wrote_full_block |=
+                serialize_optional_index_block(&current_block[..], format_version, output)?;
             block_metadata.push(SerializedBlockMeta {
                 block_id: current_block_id,
                 num_non_null_rows: current_block.len() as u32,
@@ -498,7 +550,8 @@ pub fn serialize_optional_index<W: io::Write>(
     }
 
     // handle last block
-    serialize_optional_index_block(&current_block[..], output)?;
+    wrote_full_block |=
+        serialize_optional_index_block(&current_block[..], format_version, output)?;
 
     block_metadata.push(SerializedBlockMeta {
         block_id: current_block_id,
@@ -511,7 +564,7 @@ pub fn serialize_optional_index<W: io::Write>(
 
     output.write_all((block_metadata.len() as u16).to_le_bytes().as_ref())?;
 
-    Ok(())
+    Ok(wrote_full_block)
 }
 
 const SERIALIZED_BLOCK_META_NUM_BYTES: usize = 4;
@@ -552,9 +605,15 @@ fn is_sparse(num_rows_in_block: u32) -> bool {
     num_rows_in_block < DENSE_BLOCK_THRESHOLD
 }
 
+#[inline]
+fn is_full(num_rows_in_block: u32) -> bool {
+    num_rows_in_block == ELEMENTS_PER_BLOCK
+}
+
 fn deserialize_optional_index_block_metadatas(
     data: &[u8],
     num_rows: u32,
+    format_version: Version,
 ) -> (Box<[BlockMeta]>, u32) {
     let num_blocks = data.len() / SERIALIZED_BLOCK_META_NUM_BYTES;
     let mut block_metas = Vec::with_capacity(num_blocks + 1);
@@ -577,6 +636,8 @@ fn deserialize_optional_index_block_metadatas(
             BlockVariant::Sparse {
                 num_vals: num_non_null_rows as u16,
             }
+        } else if is_full(num_non_null_rows) && format_version.allows_full_block() {
+            BlockVariant::Full
         } else {
             BlockVariant::Dense
         };
@@ -599,7 +660,7 @@ fn deserialize_optional_index_block_metadatas(
     (block_metas.into_boxed_slice(), non_null_rows_before_block)
 }
 
-pub fn open_optional_index(bytes: OwnedBytes) -> io::Result<OptionalIndex> {
+pub fn open_optional_index(bytes: OwnedBytes, format_version: Version) -> io::Result<OptionalIndex> {
     let (mut bytes, num_non_empty_blocks_bytes) = bytes.rsplit(2);
     let num_non_empty_block_bytes =
         u16::from_le_bytes(num_non_empty_blocks_bytes.as_slice().try_into().unwrap());
@@ -608,7 +669,7 @@ pub fn open_optional_index(bytes: OwnedBytes) -> io::Result<OptionalIndex> {
         num_non_empty_block_bytes as usize * SERIALIZED_BLOCK_META_NUM_BYTES;
     let (block_data, block_metas) = bytes.rsplit(block_metas_num_bytes);
     let (block_metas, num_non_null_docs) =
-        deserialize_optional_index_block_metadatas(block_metas.as_slice(), num_docs);
+        deserialize_optional_index_block_metadatas(block_metas.as_slice(), num_docs, format_version);
     let optional_index = OptionalIndex {
         num_docs,
         num_non_null_docs,

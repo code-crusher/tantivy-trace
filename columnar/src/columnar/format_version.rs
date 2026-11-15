@@ -36,6 +36,11 @@ pub const CURRENT_VERSION: Version = Version::V2;
 /// Readers that do not know `V3` fail cleanly when opening such a columnar.
 pub const PLAIN_CODEC_VERSION: Version = Version::V3;
 
+/// Version written for columnars that use at least one full block in the optional index codec.
+///
+/// Readers that do not know `V4` fail cleanly when opening such a columnar.
+pub const FULL_BLOCK_VERSION: Version = Version::V4;
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Version {
@@ -43,6 +48,8 @@ pub enum Version {
     V2 = 2u32,
     /// Same as `V2`, with plain-encoded `Str` / `Bytes` columns allowed.
     V3 = 3u32,
+    /// Same as `V3`, with full blocks in the optional index codec allowed.
+    V4 = 4u32,
 }
 
 impl Display for Version {
@@ -51,6 +58,7 @@ impl Display for Version {
             Version::V1 => write!(f, "v1"),
             Version::V2 => write!(f, "v2"),
             Version::V3 => write!(f, "v3"),
+            Version::V4 => write!(f, "v4"),
         }
     }
 }
@@ -60,7 +68,15 @@ impl Version {
     pub fn allows_plain_codec(self) -> bool {
         match self {
             Version::V1 | Version::V2 => false,
-            Version::V3 => true,
+            Version::V3 | Version::V4 => true,
+        }
+    }
+
+    /// Returns true if the optional index codec may use full blocks.
+    pub fn allows_full_block(self) -> bool {
+        match self {
+            Version::V1 | Version::V2 | Version::V3 => false,
+            Version::V4 => true,
         }
     }
 
@@ -74,6 +90,7 @@ impl Version {
             1u32 => Ok(Version::V1),
             2u32 => Ok(Version::V2),
             3u32 => Ok(Version::V3),
+            4u32 => Ok(Version::V4),
             _ => Err(InvalidData),
         }
     }
@@ -93,7 +110,7 @@ mod tests {
 
     #[test]
     fn test_footer_for_version_deserialization() {
-        for version in [Version::V1, Version::V2, Version::V3] {
+        for version in [Version::V1, Version::V2, Version::V3, Version::V4] {
             assert_eq!(parse_footer(footer_for_version(version)).unwrap(), version);
         }
     }
@@ -113,6 +130,6 @@ mod tests {
                 valid_versions.insert(i);
             }
         }
-        assert_eq!(valid_versions.len(), 3);
+        assert_eq!(valid_versions.len(), 4);
     }
 }

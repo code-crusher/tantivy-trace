@@ -7,16 +7,19 @@ use super::term_merger::{TermMerger, TermsWithSegmentOrd};
 use crate::column::serialize_column_mappable_to_u64;
 use crate::column_index::SerializableColumnIndex;
 use crate::iterable::Iterable;
-use crate::{BytesColumn, MergeRowOrder, ShuffleMergeOrder};
+use crate::{BytesColumn, MergeRowOrder, ShuffleMergeOrder, Version};
 
 // Serialize [Dictionary, Column, dictionary num bytes U32::LE]
 // Column: [Column Index, Column Values, column index num bytes U32::LE]
+/// Serializes a column, returning `true` if a full block was written.
+///
+/// See [`crate::column::serialize_column_mappable_to_u64`] for the semantics of the return value.
 pub fn merge_bytes_or_str_column(
     column_index: SerializableColumnIndex<'_>,
     bytes_columns: &[Option<BytesColumn>],
     merge_row_order: &MergeRowOrder,
     output: &mut impl Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     // Serialize dict and generate mapping for values
     let mut output = CountingWriter::wrap(output);
     // TODO !!! Remove useless terms.
@@ -34,9 +37,14 @@ pub fn merge_bytes_or_str_column(
         term_ord_mapping: &term_ord_mapping,
         merge_row_order,
     };
-    serialize_column_mappable_to_u64(column_index, &remapped_term_ordinals_values, output)?;
+    let wrote_full_block = serialize_column_mappable_to_u64(
+        column_index,
+        &remapped_term_ordinals_values,
+        Version::V4,
+        output,
+    )?;
     output.write_all(&dictionary_num_bytes.to_le_bytes())?;
-    Ok(())
+    Ok(wrote_full_block)
 }
 
 /// Computes a per-segment mapping from old term ordinal to merged term ordinal.

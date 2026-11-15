@@ -23,7 +23,7 @@ use crate::columnar::writer::column_writers::{
 use crate::columnar::writer::value_index::{IndexBuilder, PreallocatedIndexBuilders};
 use crate::dictionary::{DictionaryBuilder, TermIdMapping, UnorderedId};
 use crate::value::{Coerce, NumericalType, NumericalValue};
-use crate::{Cardinality, RowId};
+use crate::{Cardinality, RowId, Version};
 
 /// This is a set of buffers that are used to temporarily write the values into before passing them
 /// to the fast field codecs.
@@ -363,6 +363,7 @@ impl ColumnarWriter {
         columns.sort_unstable_by_key(|(column_name, col_type, _)| (*column_name, *col_type));
         let (arena, buffers, dictionaries) = (&self.arena, &mut self.buffers, &self.dictionaries);
         let mut symbol_byte_buffer: Vec<u8> = Vec::new();
+        let mut wrote_full_block = false;
         for (column_name, column_type, addr) in columns {
             if column_name.contains(&JSON_END_OF_PATH) {
                 // Tantivy uses b'0' as a separator for nested fields in JSON.
@@ -376,7 +377,7 @@ impl ColumnarWriter {
                     let cardinality = column_writer.get_cardinality(num_docs);
                     let mut column_serializer =
                         serializer.start_serialize_column(column_name, column_type);
-                    serialize_bool_column(
+                    wrote_full_block |= serialize_bool_column(
                         cardinality,
                         num_docs,
                         column_writer.operation_iterator(
@@ -394,7 +395,7 @@ impl ColumnarWriter {
                     let cardinality = column_writer.get_cardinality(num_docs);
                     let mut column_serializer =
                         serializer.start_serialize_column(column_name, ColumnType::IpAddr);
-                    serialize_ip_addr_column(
+                    wrote_full_block |= serialize_ip_addr_column(
                         cardinality,
                         num_docs,
                         column_writer.operation_iterator(
@@ -421,7 +422,7 @@ impl ColumnarWriter {
                         .get_cardinality(num_docs);
                     let mut column_serializer =
                         serializer.start_serialize_column(column_name, column_type);
-                    serialize_bytes_or_str_column(
+                    wrote_full_block |= serialize_bytes_or_str_column(
                         cardinality,
                         num_docs,
                         str_or_bytes_column_writer.sort_values_within_row,
@@ -441,7 +442,7 @@ impl ColumnarWriter {
                     let mut column_serializer =
                         serializer.start_serialize_column(column_name, column_type);
                     if self.generated_tie_breaker_columns.contains(column_name) {
-                        crate::column::serialize_generated_tie_breaker_column(
+                        wrote_full_block |= crate::column::serialize_generated_tie_breaker_column(
                             num_docs,
                             &mut column_serializer,
                         )?;
@@ -450,7 +451,7 @@ impl ColumnarWriter {
                             self.numerical_field_hash_map.read(addr);
                         let cardinality = numerical_column_writer.cardinality(num_docs);
                         let numerical_type = column_type.numerical_type().unwrap();
-                        serialize_numerical_column(
+                        wrote_full_block |= serialize_numerical_column(
                             cardinality,
                             num_docs,
                             numerical_type,
@@ -470,7 +471,7 @@ impl ColumnarWriter {
                     let cardinality = column_writer.get_cardinality(num_docs);
                     let mut column_serializer =
                         serializer.start_serialize_column(column_name, ColumnType::DateTime);
-                    serialize_numerical_column(
+                    wrote_full_block |= serialize_numerical_column(
                         cardinality,
                         num_docs,
                         NumericalType::I64,
@@ -486,7 +487,7 @@ impl ColumnarWriter {
                 }
             };
         }
-        serializer.finalize(num_docs)?;
+        serializer.finalize(num_docs, wrote_full_block)?;
         Ok(())
     }
 }
@@ -571,6 +572,7 @@ fn collect_sort_order_from_ops<V, K: Clone>(
 
 // Serialize [Dictionary, Column, dictionary num bytes U32::LE]
 // Column: [Column Index, Column Values, column index num bytes U32::LE]
+/// Serializes a column, returning `true` if a full block was written.
 #[expect(clippy::too_many_arguments)]
 fn serialize_bytes_or_str_column(
     cardinality: Cardinality,
@@ -581,7 +583,7 @@ fn serialize_bytes_or_str_column(
     buffers: &mut SpareBuffers,
     arena: &MemoryArena,
     wrt: impl io::Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let SpareBuffers {
         value_index_builders,
         u64_values,
@@ -602,7 +604,7 @@ fn serialize_bytes_or_str_column(
             ColumnOperation::NewDoc(doc) => ColumnOperation::NewDoc(doc),
         }
     });
-    send_to_serialize_column_mappable_to_u64(
+    let wrote_full_block = send_to_serialize_column_mappable_to_u64(
         operation_iterator,
         cardinality,
         num_docs,
@@ -612,9 +614,10 @@ fn serialize_bytes_or_str_column(
         &mut wrt,
     )?;
     wrt.write_all(&dictionary_num_bytes.to_le_bytes()[..])?;
-    Ok(())
+    Ok(wrote_full_block)
 }
 
+/// Serializes a column, returning `true` if a full block was written.
 fn serialize_numerical_column(
     cardinality: Cardinality,
     num_docs: RowId,
@@ -622,7 +625,7 @@ fn serialize_numerical_column(
     op_iterator: impl Iterator<Item = ColumnOperation<NumericalValue>>,
     buffers: &mut SpareBuffers,
     wrt: &mut impl io::Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let SpareBuffers {
         value_index_builders,
         u64_values,
@@ -638,7 +641,7 @@ fn serialize_numerical_column(
                 value_index_builders,
                 u64_values,
                 wrt,
-            )?;
+            )
         }
         NumericalType::U64 => {
             send_to_serialize_column_mappable_to_u64(
@@ -649,7 +652,7 @@ fn serialize_numerical_column(
                 value_index_builders,
                 u64_values,
                 wrt,
-            )?;
+            )
         }
         NumericalType::F64 => {
             send_to_serialize_column_mappable_to_u64(
@@ -660,19 +663,19 @@ fn serialize_numerical_column(
                 value_index_builders,
                 u64_values,
                 wrt,
-            )?;
+            )
         }
-    };
-    Ok(())
+    }
 }
 
+/// Serializes a column, returning `true` if a full block was written.
 fn serialize_bool_column(
     cardinality: Cardinality,
     num_docs: RowId,
     column_operations_it: impl Iterator<Item = ColumnOperation<bool>>,
     buffers: &mut SpareBuffers,
     wrt: &mut impl io::Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let SpareBuffers {
         value_index_builders,
         u64_values,
@@ -689,17 +692,17 @@ fn serialize_bool_column(
         value_index_builders,
         u64_values,
         wrt,
-    )?;
-    Ok(())
+    )
 }
 
+/// Serializes a column, returning `true` if a full block was written.
 fn serialize_ip_addr_column(
     cardinality: Cardinality,
     num_docs: RowId,
     column_operations_it: impl Iterator<Item = ColumnOperation<Ipv6Addr>>,
     buffers: &mut SpareBuffers,
     wrt: &mut impl io::Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let SpareBuffers {
         value_index_builders,
         ip_addr_values,
@@ -712,8 +715,7 @@ fn serialize_ip_addr_column(
         value_index_builders,
         ip_addr_values,
         wrt,
-    )?;
-    Ok(())
+    )
 }
 
 fn send_to_serialize_column_mappable_to_u128<
@@ -725,7 +727,7 @@ fn send_to_serialize_column_mappable_to_u128<
     value_index_builders: &mut PreallocatedIndexBuilders,
     values: &mut Vec<T>,
     mut wrt: impl io::Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     values.clear();
     // TODO: split index and values
     let serializable_column_index = match cardinality {
@@ -756,9 +758,9 @@ fn send_to_serialize_column_mappable_to_u128<
     crate::column::serialize_column_mappable_to_u128(
         serializable_column_index,
         &&values[..],
+        Version::V4,
         &mut wrt,
-    )?;
-    Ok(())
+    )
 }
 
 fn send_to_serialize_column_mappable_to_u64(
@@ -769,7 +771,7 @@ fn send_to_serialize_column_mappable_to_u64(
     value_index_builders: &mut PreallocatedIndexBuilders,
     values: &mut Vec<u64>,
     mut wrt: impl io::Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     values.clear();
     let serializable_column_index = match cardinality {
         Cardinality::Full => {
@@ -805,9 +807,9 @@ fn send_to_serialize_column_mappable_to_u64(
     crate::column::serialize_column_mappable_to_u64(
         serializable_column_index,
         &&values[..],
+        Version::V4,
         &mut wrt,
-    )?;
-    Ok(())
+    )
 }
 
 fn sort_values_within_row_in_place(

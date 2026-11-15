@@ -176,9 +176,9 @@ mod tests {
             panic!("Expected a multivalued index")
         };
         let mut output = Vec::new();
-        serialize_multivalued_index(&start_index_iterable, &mut output).unwrap();
+        serialize_multivalued_index(&start_index_iterable, crate::Version::V4, &mut output).unwrap();
         let multivalue =
-            open_multivalued_index(OwnedBytes::new(output), crate::Version::V2).unwrap();
+            open_multivalued_index(OwnedBytes::new(output), crate::Version::V4).unwrap();
         let start_indexes: Vec<RowId> = multivalue.get_start_index_column().iter().collect();
         assert_eq!(&start_indexes, &[0, 3, 5]);
     }
@@ -214,9 +214,9 @@ mod tests {
             panic!("Expected a multivalued index")
         };
         let mut output = Vec::new();
-        serialize_multivalued_index(&start_index_iterable, &mut output).unwrap();
+        serialize_multivalued_index(&start_index_iterable, crate::Version::V4, &mut output).unwrap();
         let multivalue =
-            open_multivalued_index(OwnedBytes::new(output), crate::Version::V2).unwrap();
+            open_multivalued_index(OwnedBytes::new(output), crate::Version::V4).unwrap();
         let start_indexes: Vec<RowId> = multivalue.get_start_index_column().iter().collect();
         assert_eq!(&start_indexes, &[0, 3, 5, 6]);
     }

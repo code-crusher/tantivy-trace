@@ -1081,3 +1081,63 @@ fn test_delete_decrease_cardinality() {
     assert_eq!(cols[0].column_type(), ColumnType::I64);
     assert_eq!(cols[0].open().unwrap().get_cardinality(), Cardinality::Full);
 }
+
+#[test]
+fn test_full_block_version_stamping() {
+    use crate::{Version, ColumnarReader};
+
+    // A columnar with a full block (every doc of a block has a value) must be stamped V4.
+    // The cardinality is Optional because the last doc is missing a value, but the first
+    // block (0..65536) is full.
+    let mut full_writer = ColumnarWriter::default();
+    for doc in 0..(u16::MAX as u32 + 1) {
+        full_writer.record_numerical(doc, "score", doc as u64);
+    }
+    let mut full_buffer = Vec::new();
+    full_writer
+        .serialize(u16::MAX as u32 + 2, None, &mut full_buffer)
+        .unwrap();
+    let footer_offset = full_buffer.len() - 8;
+    let footer_bytes: [u8; 8] =
+        full_buffer[footer_offset..].try_into().unwrap();
+    // The footer is the little-endian version bytes followed by the columnar magic bytes.
+    let mut expected_footer = [0u8; 8];
+    expected_footer[0..4].copy_from_slice(&(Version::V4 as u32).to_le_bytes());
+    expected_footer[4..8].copy_from_slice(&[2, 113, 119, 66]);
+    assert_eq!(footer_bytes, expected_footer);
+    // The full block is readable and all docs have a value.
+    let full_columnar = ColumnarReader::open(full_buffer).unwrap();
+    assert_eq!(full_columnar.num_docs(), u16::MAX as u32 + 2);
+    let cols = full_columnar.read_columns("score").unwrap();
+    let column = cols[0].open().unwrap();
+    assert_eq!(column.get_cardinality(), Cardinality::Optional);
+    let column = column
+        .coerce_numerical(crate::NumericalType::U64)
+        .unwrap();
+    let crate::DynamicColumn::U64(column) = column else {
+        panic!();
+    };
+    assert!(column.first(0).is_some());
+    assert!(column.first(u16::MAX as u32).is_some());
+    assert!(column.first(u16::MAX as u32 + 1).is_none());
+
+    // A columnar without a full block keeps the base version, so that older readers can
+    // still open it.
+    let mut sparse_writer = ColumnarWriter::default();
+    sparse_writer.record_numerical(0, "score", 0u64);
+    sparse_writer.record_numerical(u16::MAX as u32, "score", 1u64);
+    let mut sparse_buffer = Vec::new();
+    sparse_writer
+        .serialize(u16::MAX as u32 + 1, None, &mut sparse_buffer)
+        .unwrap();
+    let footer_offset = sparse_buffer.len() - 8;
+    let footer_bytes: [u8; 8] =
+        sparse_buffer[footer_offset..].try_into().unwrap();
+    let mut expected_footer = [0u8; 8];
+    expected_footer[0..4].copy_from_slice(&(Version::V2 as u32).to_le_bytes());
+    expected_footer[4..8].copy_from_slice(&[2, 113, 119, 66]);
+    assert_eq!(footer_bytes, expected_footer);
+    let sparse_columnar = ColumnarReader::open(sparse_buffer).unwrap();
+    let cols = sparse_columnar.read_columns("score").unwrap();
+    assert_eq!(cols[0].open().unwrap().get_cardinality(), Cardinality::Optional);
+}

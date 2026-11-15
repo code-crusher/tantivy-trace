@@ -637,3 +637,47 @@ proptest! {
 
     }
 }
+
+#[test]
+fn test_merge_full_block_version_stamping() {
+    // Two columnars whose merge produces a full block: the merged columnar must be stamped V4.
+    // The first columnar fills docs 0..65536, and the second columnar's trailing doc is missing,
+    // so the merged column is Optional with a full first block.
+    let mut columnar1 = ColumnarWriter::default();
+    for doc in 0..(u16::MAX as u32 + 1) {
+        columnar1.record_numerical(doc, "score", doc as u64);
+    }
+    let mut buffer1 = Vec::new();
+    columnar1.serialize(u16::MAX as u32 + 1, None, &mut buffer1).unwrap();
+    let reader1 = ColumnarReader::open(buffer1).unwrap();
+
+    // Doc 65536 has a value, doc 65537 is missing, so the merged cardinality is Optional.
+    let mut columnar2 = ColumnarWriter::default();
+    columnar2.record_numerical(0, "score", 42u64);
+    let mut buffer2 = Vec::new();
+    columnar2.serialize(2, None, &mut buffer2).unwrap();
+    let reader2 = ColumnarReader::open(buffer2).unwrap();
+
+    let columnars = &[&reader1, &reader2];
+    let stack_merge_order = StackMergeOrder::stack(columnars);
+    let mut out = Vec::new();
+    crate::columnar::merge_columnar(
+        columnars,
+        &[],
+        MergeRowOrder::Stack(stack_merge_order),
+        &mut out,
+    )
+    .unwrap();
+    let footer_offset = out.len() - 8;
+    let footer_bytes: [u8; 8] = out[footer_offset..].try_into().unwrap();
+    let mut expected_footer = [0u8; 8];
+    expected_footer[0..4].copy_from_slice(&(crate::Version::V4 as u32).to_le_bytes());
+    expected_footer[4..8].copy_from_slice(&[2, 113, 119, 66]);
+    assert_eq!(footer_bytes, expected_footer);
+    let merged_reader = ColumnarReader::open(out).unwrap();
+    assert_eq!(merged_reader.num_docs(), u16::MAX as u32 + 3);
+    let cols = merged_reader.read_columns("score").unwrap();
+    assert_eq!(cols.len(), 1);
+    let column = cols[0].open().unwrap();
+    assert_eq!(column.get_cardinality(), Cardinality::Optional);
+}

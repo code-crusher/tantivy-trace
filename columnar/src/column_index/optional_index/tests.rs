@@ -79,8 +79,8 @@ proptest! {
 fn test_with_random_sets_simple() {
     let vals = 10..ELEMENTS_PER_BLOCK * 2;
     let mut out: Vec<u8> = Vec::new();
-    serialize_optional_index(&vals, 100, &mut out).unwrap();
-    let null_index = open_optional_index(OwnedBytes::new(out)).unwrap();
+    serialize_optional_index(&vals, 100, Version::V4, &mut out).unwrap();
+    let null_index = open_optional_index(OwnedBytes::new(out), Version::V4).unwrap();
     let ranks: Vec<u32> = (65_472u32..65_473u32).collect();
     let els: Vec<u32> = ranks.iter().copied().map(|rank| rank + 10).collect();
     let mut select_cursor = null_index.select_cursor();
@@ -122,8 +122,8 @@ impl<'a> Iterable<RowId> for &'a [bool] {
 
 fn test_null_index(data: &[bool]) {
     let mut out: Vec<u8> = Vec::new();
-    serialize_optional_index(&data, data.len() as RowId, &mut out).unwrap();
-    let null_index = open_optional_index(OwnedBytes::new(out)).unwrap();
+    serialize_optional_index(&data, data.len() as RowId, Version::V4, &mut out).unwrap();
+    let null_index = open_optional_index(OwnedBytes::new(out), Version::V4).unwrap();
     let orig_idx_with_value: Vec<u32> = data
         .iter()
         .enumerate()
@@ -330,6 +330,151 @@ fn test_optional_index_iter_dense_block() {
     block.push(3u32);
     block.extend((0..ELEMENTS_PER_BLOCK).map(|i| i + ELEMENTS_PER_BLOCK + 1));
     test_optional_index_iter_aux(&block, 3 * ELEMENTS_PER_BLOCK);
+}
+
+#[test]
+fn test_optional_index_full_block() {
+    // A full block is a block where every document has a value.
+    let full_block: Vec<RowId> = (0..ELEMENTS_PER_BLOCK).collect();
+    let optional_index = OptionalIndex::for_test(ELEMENTS_PER_BLOCK, &full_block);
+    assert_eq!(optional_index.num_non_nulls(), ELEMENTS_PER_BLOCK);
+    assert!(matches!(
+        optional_index.block_metas[0].block_variant,
+        BlockVariant::Full
+    ));
+    assert_eq!(
+        optional_index.block_metas[0].block_variant.num_bytes_in_block(),
+        set_block::FULL_BLOCK_NUM_BYTES
+    );
+    // rank/select are the identity within a full block.
+    for row_id in [0u32, 1, 63, 64, 65_000, ELEMENTS_PER_BLOCK - 1] {
+        assert!(optional_index.contains(row_id));
+        assert_eq!(optional_index.rank(row_id), row_id);
+        assert_eq!(optional_index.rank_if_exists(row_id), Some(row_id));
+        assert_eq!(optional_index.select(row_id), row_id);
+    }
+    assert_eq!(optional_index.next_non_null_doc(0), Some(0));
+    assert_eq!(
+        optional_index.next_non_null_doc(ELEMENTS_PER_BLOCK - 1),
+        Some(ELEMENTS_PER_BLOCK - 1)
+    );
+    assert_eq!(optional_index.next_non_null_doc(ELEMENTS_PER_BLOCK), None);
+    // iterating over non-null docs returns every doc.
+    assert!(optional_index.iter_non_null_docs().eq(0..ELEMENTS_PER_BLOCK));
+}
+
+#[test]
+fn test_optional_index_full_block_rank_if_exists_batch() {
+    let full_block: Vec<RowId> = (0..ELEMENTS_PER_BLOCK).collect();
+    let optional_index = OptionalIndex::for_test(ELEMENTS_PER_BLOCK, &full_block);
+    let doc_ids: Vec<DocId> = (0..ELEMENTS_PER_BLOCK).step_by(1_000).collect();
+    assert_rank_if_exists_batch_matches_scalar(&optional_index, &doc_ids);
+}
+
+#[test]
+fn test_optional_index_full_block_trailing_sparse() {
+    // Full blocks interleaved with sparse blocks.
+    let mut row_ids: Vec<RowId> = (0..ELEMENTS_PER_BLOCK).collect();
+    row_ids.extend([ELEMENTS_PER_BLOCK + 5, 2 * ELEMENTS_PER_BLOCK + 7]);
+    let optional_index = OptionalIndex::for_test(2 * ELEMENTS_PER_BLOCK + 8, &row_ids);
+    assert!(matches!(
+        optional_index.block_metas[0].block_variant,
+        BlockVariant::Full
+    ));
+    assert!(optional_index.contains(ELEMENTS_PER_BLOCK + 5));
+    assert!(!optional_index.contains(ELEMENTS_PER_BLOCK + 6));
+    // Ranks: block 0 holds ELEMENTS_PER_BLOCK values, then ELEMENTS_PER_BLOCK+5.
+    assert_eq!(
+        optional_index.rank(ELEMENTS_PER_BLOCK + 6),
+        ELEMENTS_PER_BLOCK + 1
+    );
+    // The first rank after the full block maps to the first value of the next block.
+    assert_eq!(
+        optional_index.select(ELEMENTS_PER_BLOCK),
+        ELEMENTS_PER_BLOCK + 5
+    );
+    assert_eq!(
+        optional_index.select(ELEMENTS_PER_BLOCK + 1),
+        2 * ELEMENTS_PER_BLOCK + 7
+    );
+    assert_eq!(
+        optional_index.next_non_null_doc(ELEMENTS_PER_BLOCK + 4),
+        Some(ELEMENTS_PER_BLOCK + 5)
+    );
+    let doc_ids = [
+        0,
+        ELEMENTS_PER_BLOCK - 1,
+        ELEMENTS_PER_BLOCK,
+        ELEMENTS_PER_BLOCK + 5,
+        ELEMENTS_PER_BLOCK + 6,
+        2 * ELEMENTS_PER_BLOCK + 7,
+    ];
+    assert_rank_if_exists_batch_matches_scalar(&optional_index, &doc_ids);
+}
+
+#[test]
+fn test_optional_index_full_block_saves_space() {
+    // A full block takes no data space at all, unlike a dense block.
+    let full_block = 0..ELEMENTS_PER_BLOCK;
+    let mut full_buffer = Vec::new();
+    let wrote_full_block =
+        serialize_optional_index(&full_block, ELEMENTS_PER_BLOCK, Version::V4, &mut full_buffer)
+            .unwrap();
+    assert!(wrote_full_block);
+    // Old format writes a dense block: 1 byte cardinality is not included here,
+    // so compare the optional index buffers directly.
+    let mut dense_buffer = Vec::new();
+    let wrote_full_block_v3 =
+        serialize_optional_index(&full_block, ELEMENTS_PER_BLOCK, Version::V3, &mut dense_buffer)
+            .unwrap();
+    assert!(!wrote_full_block_v3);
+    assert!(
+        full_buffer.len() < dense_buffer.len(),
+        "full block buffer ({}) should be smaller than dense ({})",
+        full_buffer.len(),
+        dense_buffer.len()
+    );
+    // The full block stores only the VInt num_docs (3 bytes for 65536)
+    // + block metadata + num_blocks.
+    assert_eq!(full_buffer.len(), 3 + SERIALIZED_BLOCK_META_NUM_BYTES + 2);
+}
+
+#[test]
+fn test_optional_index_full_block_version_compat() {
+    // A block holding every element is ambiguous: V3 and earlier store it as a dense block,
+    // V4 stores it as a full block. The version decides the interpretation.
+    let full_block = 0..ELEMENTS_PER_BLOCK;
+
+    // A V3 writer stores the full block as a dense block: opening it (as any reader would,
+    // based on the file's version) must yield a dense block.
+    let mut v3_buffer = Vec::new();
+    let wrote_full_block_v3 =
+        serialize_optional_index(&full_block, ELEMENTS_PER_BLOCK, Version::V3, &mut v3_buffer).unwrap();
+    assert!(!wrote_full_block_v3);
+    assert_eq!(
+        v3_buffer.len(),
+        3 + DENSE_BLOCK_NUM_BYTES as usize + SERIALIZED_BLOCK_META_NUM_BYTES + 2
+    );
+    let index_v3 = open_optional_index(OwnedBytes::new(v3_buffer), Version::V3).unwrap();
+    assert!(matches!(
+        index_v3.block_metas[0].block_variant,
+        BlockVariant::Dense
+    ));
+    assert!(index_v3.contains(0));
+    assert_eq!(index_v3.rank(ELEMENTS_PER_BLOCK - 1), ELEMENTS_PER_BLOCK - 1);
+
+    // A V4 writer stores it as a full block (no data at all).
+    let mut v4_buffer = Vec::new();
+    let wrote_full_block_v4 =
+        serialize_optional_index(&full_block, ELEMENTS_PER_BLOCK, Version::V4, &mut v4_buffer).unwrap();
+    assert!(wrote_full_block_v4);
+    let index_v4 = open_optional_index(OwnedBytes::new(v4_buffer), Version::V4).unwrap();
+    assert!(matches!(
+        index_v4.block_metas[0].block_variant,
+        BlockVariant::Full
+    ));
+    assert!(index_v4.contains(0));
+    assert_eq!(index_v4.rank(ELEMENTS_PER_BLOCK - 1), ELEMENTS_PER_BLOCK - 1);
 }
 
 #[test]

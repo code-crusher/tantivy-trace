@@ -15,27 +15,33 @@ use crate::column_values::{
 use crate::iterable::Iterable;
 use crate::{StrColumn, Version};
 
+/// Serializes a column, returning `true` if a full block was written.
+///
+/// See [`crate::column_index::serialize_column_index`] for the semantics of the return value.
 pub fn serialize_column_mappable_to_u128<T: MonotonicallyMappableToU128>(
     column_index: SerializableColumnIndex<'_>,
     iterable: &dyn Iterable<T>,
+    format_version: Version,
     output: &mut impl Write,
-) -> io::Result<()> {
-    let column_index_num_bytes = serialize_column_index(column_index, output)?;
+) -> io::Result<bool> {
+    let (column_index_num_bytes, wrote_full_block) =
+        serialize_column_index(column_index, format_version, output)?;
     serialize_column_values_u128(iterable, output)?;
     output.write_all(&column_index_num_bytes.to_le_bytes())?;
-    Ok(())
+    Ok(wrote_full_block)
 }
 
 pub(crate) fn serialize_generated_tie_breaker_column(
     num_docs: u32,
     output: &mut impl Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     // TODO: Lift this temporary i32 limit once downstream consumers support the full i64 range.
     let max_start = i32::MAX as i64 - num_docs as i64;
     let start: i64 = rand::rng().random_range(i32::MIN as i64..=max_start);
     let end = start + num_docs as i64;
     let values = start..end;
-    let column_index_num_bytes = serialize_column_index(SerializableColumnIndex::Full, output)?;
+    let (column_index_num_bytes, _) =
+        serialize_column_index(SerializableColumnIndex::Full, Version::V4, output)?;
     serialize_u64_based_column_values(
         &values,
         &[
@@ -46,22 +52,27 @@ pub(crate) fn serialize_generated_tie_breaker_column(
         output,
     )?;
     output.write_all(&column_index_num_bytes.to_le_bytes())?;
-    Ok(())
+    Ok(false)
 }
 
+/// Serializes a column, returning `true` if a full block was written.
+///
+/// See [`crate::column_index::serialize_column_index`] for the semantics of the return value.
 pub fn serialize_column_mappable_to_u64<T: MonotonicallyMappableToU64>(
     column_index: SerializableColumnIndex<'_>,
     column_values: &impl Iterable<T>,
+    format_version: Version,
     output: &mut impl Write,
-) -> io::Result<()> {
-    let column_index_num_bytes = serialize_column_index(column_index, output)?;
+) -> io::Result<bool> {
+    let (column_index_num_bytes, wrote_full_block) =
+        serialize_column_index(column_index, format_version, output)?;
     serialize_u64_based_column_values(
         column_values,
         &[CodecType::Bitpacked, CodecType::BlockwiseLinear],
         output,
     )?;
     output.write_all(&column_index_num_bytes.to_le_bytes())?;
-    Ok(())
+    Ok(wrote_full_block)
 }
 
 pub fn open_column_u64<T: MonotonicallyMappableToU64>(
